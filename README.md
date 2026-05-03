@@ -1,3 +1,12 @@
+# Engram by Laeka — the cognitive memory engine
+
+> **This is a hard fork of [mycelium](https://github.com/Dewinator/mycelium) by Dewinator**, rebranded and extended as the cognitive memory engine for the Laeka cognitive stack. Original Mycelium foundation kept; Engram adds hybrid retrieval, score formula refactor, concurrent write safety, scoped destructive ops, and input validation hardening.
+>
+> See **[LAEKA-ENGRAM.md](LAEKA-ENGRAM.md)** for Engram-specific deviations, fixes, and roadmap.
+> Upstream technical documentation continues below for reference.
+
+---
+
 <p align="center">
   <img src="docs/images/logo.png" alt="mycelium" width="320" />
 </p>

@@ -1,7 +1,7 @@
 {
-  "name": "mycelium-mcp-server",
+  "name": "engram-mcp-server",
   "version": "0.1.0",
-  "description": "mycelium — cognitive architecture MCP server (Supabase pgvector + Ollama). Works with any MCP client.",
+  "description": "Engram by Laeka — the cognitive memory engine. MCP server (Supabase pgvector + Ollama + hybrid retrieval). Forked from mycelium-mcp.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
