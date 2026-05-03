@@ -28,7 +28,7 @@ Mycelium core architecture, MCP tool schemas, Supabase migrations, and cognitive
 - [x] Hybrid BM25 + cosine retrieval (commit `93176c0`)
 - [x] Stress-test report (14 findings, 6 HIGH severity)
 - [x] Brand identity established
-- [ ] Score formula refactor R1 (additive log-scale)
+- [x] Score formula refactor R1 (additive log-scale) — see `docs/engram-scoring.md`
 - [ ] Empty query validation R6
 - [ ] Scoping params for destructive tools R2
 

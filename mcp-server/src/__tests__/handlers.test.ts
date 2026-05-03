@@ -273,7 +273,18 @@ test("recall emits recalled memory_event with hit count and top score", async ()
   assert.equal(svc.recalledEvents.length, 1);
   const ev = svc.recalledEvents[0];
   assert.equal(ev.hits, 2);
-  assert.equal(ev.topScore, 0.812);
+  // R1 additive scoring overwrites effective_score with the new ranking
+  // value; the original SQL multiplicative score 0.812 is gone by design.
+  // Expected: hybrid (α·cosine_norm + (1−α)·bm25_norm) + log(1+strength)·β
+  // ≈ 0.7693 for the top hit (full derivation in docs/engram-scoring.md).
+  assert.ok(
+    ev.topScore > 0 && ev.topScore < 1,
+    `topScore should be a normalized additive score in (0,1), got ${ev.topScore}`
+  );
+  assert.ok(
+    Math.abs(ev.topScore - 0.7693) < 0.01,
+    `topScore should match additive formula (~0.7693), got ${ev.topScore}`
+  );
   assert.equal(ev.queryLength, "two hits".length);
   assert.equal(ev.source, "mcp:recall");
 });

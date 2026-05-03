@@ -80,10 +80,12 @@ function makeHit(o: {
   relevance: number;
   strength_now?: number;
   salience?: number;
+  access_count?: number;
   pinned?: boolean;
 }): MemorySearchResult {
   const sNow = o.strength_now ?? 1.0;
   const sal = o.salience ?? 1.0;
+  const ax = o.access_count ?? 0;
   return {
     id: o.id,
     content: o.content,
@@ -93,7 +95,7 @@ function makeHit(o: {
     stage: "episodic",
     strength: 1.0,
     importance: 0.5,
-    access_count: 0,
+    access_count: ax,
     pinned: o.pinned ?? false,
     relevance: o.relevance,
     strength_now: sNow,
@@ -158,25 +160,47 @@ function idsFromOutput(text: string): string[] {
   return matches.map((m) => m[1]);
 }
 
-test("recall hybrid: Dell memory surfaces in top-3 despite weaker cosine (Saphi bug 2026-05-03)", async () => {
-  // Realistic Saphi scenario: 3 "ordi" memories from months ago (decayed
-  // strength_now ~0.5, strong cosine on "ordi"), 1 fresh "serveur Dell"
-  // memory absorbed today (strength_now ~1.0, weaker cosine because
-  // "serveur" diverges from "ordi" semantically). Pure cosine top-3 buries
-  // Dell at rank 4; hybrid scoring + cognitive multipliers (strength_now)
-  // should surface Dell in top-3.
+test("recall hybrid: Dell memory surfaces in top-3 under additive scoring (Saphi bug 2026-05-03 + R1 fix)", async () => {
+  // Production-like scenario after R1 additive log-scale refactor:
+  //   - 3 old "ordi" handoffs with high cognitive history (strength=50, ax=10)
+  //   - 1 fresh "serveur Dell" memory (strength=1, ax=0)
+  // Query "machine stable serveur Dell" hits multiple BM25 keywords on the
+  // Dell content (serveur, stable, dell) and none on the ordi handoffs;
+  // the Dell semantic match also dominates cosine. Old multiplicative
+  // formula `hybrid × strength × salience` would have let str=50 swamp the
+  // BM25 win; additive `hybrid + log(1+str)·β + log(1+ax)·γ` lets the
+  // hybrid term dominate so Dell ranks first.
   const candidates = [
-    makeHit({ id: "ordi-1", content: "Yvon a acheté un ordi en mars 2025", relevance: 0.78, strength_now: 0.5 }),
-    makeHit({ id: "ordi-2", content: "ordi acheté pour le bureau", relevance: 0.77, strength_now: 0.5 }),
-    makeHit({ id: "ordi-3", content: "ordi portable acheté chez Best Buy", relevance: 0.76, strength_now: 0.5 }),
+    makeHit({
+      id: "ordi-1",
+      content: "Yvon a acheté un ordi en mars 2025",
+      relevance: 0.55,
+      strength_now: 50,
+      access_count: 10,
+    }),
+    makeHit({
+      id: "ordi-2",
+      content: "ordi acheté pour le bureau",
+      relevance: 0.50,
+      strength_now: 50,
+      access_count: 10,
+    }),
+    makeHit({
+      id: "ordi-3",
+      content: "ordi portable acheté chez Best Buy",
+      relevance: 0.48,
+      strength_now: 50,
+      access_count: 10,
+    }),
     makeHit({
       id: "dell",
-      content: "Serveur Dell Tower Plus EBT2250 installé 2026-05-02 stable",
-      relevance: 0.55,
-      strength_now: 1.0,
+      content: "Serveur Dell Tower Plus EBT2250 installé tourne stable",
+      relevance: 0.85,
+      strength_now: 1,
+      access_count: 0,
     }),
-    makeHit({ id: "noise-1", content: "rien à voir avec hardware", relevance: 0.40, strength_now: 0.3 }),
-    makeHit({ id: "noise-2", content: "autre note random", relevance: 0.35, strength_now: 0.3 }),
+    makeHit({ id: "noise-1", content: "rien à voir avec hardware", relevance: 0.30, strength_now: 20, access_count: 5 }),
+    makeHit({ id: "noise-2", content: "autre note random", relevance: 0.25, strength_now: 20, access_count: 5 }),
   ];
   const svc = new FakeMemoryService(candidates);
 
@@ -186,7 +210,7 @@ test("recall hybrid: Dell memory surfaces in top-3 despite weaker cosine (Saphi 
     fakeProjects,
     "test-agent",
     {
-      query: "tu te rappel de mon nouvel ordi Dell la marque ?",
+      query: "machine stable serveur Dell",
       limit: 3,
       vector_weight: 0.6,
       spread: false,

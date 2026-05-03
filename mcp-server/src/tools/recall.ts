@@ -12,38 +12,79 @@ import { bm25Score, normalizeScores } from "../services/bm25.js";
 // Without the flag, behaviour is unchanged: every memory is visible.
 const PRIVATE_BY_DEFAULT = process.env.MYCELIUM_PRIVATE_BY_DEFAULT === "1";
 
-// Hybrid retrieval — blend cosine + BM25 to fix vocab-divergent blind spots
-// (query "ordi" vs memory "serveur Dell": same hardware, different words).
-// SQL match_memories_cognitive already exposes a vector_weight knob, but its
-// FTS branch uses to_tsvector('german', ...) (migration 060), which scores
-// near-zero on FR/EN content. We bypass that path by passing vector_weight=1.0
-// to SQL (pure cosine relevance, wider candidate pool) and re-rank in TS
-// with Okapi BM25 over the candidate content.
+// Hybrid retrieval (R1 additive log-scale) — blend cosine + BM25 to fix
+// vocab-divergent blind spots (query "ordi" vs memory "serveur Dell": same
+// hardware, different words). SQL match_memories_cognitive already exposes
+// a vector_weight knob, but its FTS branch uses to_tsvector('german', ...)
+// (migration 060), which scores near-zero on FR/EN content. We bypass that
+// path by passing vector_weight=1.0 to SQL (pure cosine relevance, wider
+// candidate pool) and re-rank in TS with Okapi BM25 over the candidate
+// content.
+//
+// Score formula (post-stress-test 2026-05-03 HIGH-1 fix):
+//   final = (α·cosine_norm + (1−α)·bm25_norm)
+//         + log(1 + strength_now)  · β
+//         + log(1 + access_count)  · γ
+//
+// Why additive log-scale instead of multiplicative cognitive multipliers:
+// the previous `hybrid × strength_now × salience` allowed runaway-multiplier
+// memories (e.g. canonical drift alert with strength=55, ax=99) to dominate
+// every generic query — the BM25 keyword gain was swamped on real DBs. Log
+// compression caps the boost (log(61)·0.1 ≈ 0.41, log(101)·0.05 ≈ 0.23) so
+// cognitive history nudges ranking but cannot override semantic match.
+//
+// Env-configurable parameters:
+//   ENGRAM_HYBRID_ALPHA      — α, cosine vs BM25 weight in [0,1]   (default 0.6)
+//                              (also accepts MYCELIUM_HYBRID_ALPHA for back-compat)
+//   ENGRAM_STRENGTH_BETA     — β, log(1+strength_now) coefficient  (default 0.1)
+//   ENGRAM_ACTIVATION_GAMMA  — γ, log(1+access_count) coefficient  (default 0.05)
+function readEnvFloat(name: string, fallback: number, min = 0, max = Infinity): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const v = parseFloat(raw);
+  if (!Number.isFinite(v) || v < min || v > max) return fallback;
+  return v;
+}
+
 const HYBRID_ALPHA_DEFAULT = ((): number => {
-  const raw = process.env.MYCELIUM_HYBRID_ALPHA;
+  // ENGRAM_HYBRID_ALPHA wins; MYCELIUM_HYBRID_ALPHA accepted as legacy alias.
+  const raw =
+    process.env.ENGRAM_HYBRID_ALPHA ?? process.env.MYCELIUM_HYBRID_ALPHA;
   if (raw === undefined) return 0.6;
   const v = parseFloat(raw);
   return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.6;
 })();
+const STRENGTH_BETA_DEFAULT = readEnvFloat("ENGRAM_STRENGTH_BETA", 0.1, 0);
+const ACTIVATION_GAMMA_DEFAULT = readEnvFloat("ENGRAM_ACTIVATION_GAMMA", 0.05, 0);
 const CANDIDATE_POOL_MULTIPLIER = 3;
 const CANDIDATE_POOL_FLOOR = 30;
 
-function rerankHybrid(
+export function rerankHybrid(
   candidates: MemorySearchResult[],
   query: string,
   alpha: number,
-  limit: number
+  limit: number,
+  beta: number = STRENGTH_BETA_DEFAULT,
+  gamma: number = ACTIVATION_GAMMA_DEFAULT
 ): MemorySearchResult[] {
   if (candidates.length === 0) return candidates;
-  // Single-item pool or pure cosine → nothing to re-rank. SQL already
-  // returned the cognitive-cosine ordering.
-  if (candidates.length <= 1 || alpha >= 1) return candidates.slice(0, limit);
+  // Single-item pool — nothing to re-rank. Preserve SQL's effective_score
+  // and ordering for downstream telemetry / pre-existing test assertions.
+  if (candidates.length <= 1) return candidates.slice(0, limit);
 
-  const bm25 = bm25Score(
-    query,
-    candidates.map((c) => ({ id: c.id, text: c.content }))
-  );
-  const bm25Norm = new Map(normalizeScores(bm25).map((s) => [s.id, s.score]));
+  // BM25 only matters when α < 1; skip the work when caller asked for pure
+  // cosine to save tokenisation + IDF computation on every hit.
+  const bm25Norm =
+    alpha < 1
+      ? new Map(
+          normalizeScores(
+            bm25Score(
+              query,
+              candidates.map((c) => ({ id: c.id, text: c.content }))
+            )
+          ).map((s) => [s.id, s.score])
+        )
+      : new Map<string, number>();
 
   // SQL was called with vector_weight=1.0, so `relevance` IS the raw cosine
   // similarity (1 − distance). Min-max within the pool so both signals share
@@ -54,19 +95,20 @@ function rerankHybrid(
     ).map((s) => [s.id, s.score])
   );
 
-  // Sort key = hybrid relevance × strength_now × salience. The cognitive
-  // multipliers preserve recency/usage/pinned biasing on top of the new
-  // keyword+vector blend. We do NOT overwrite `effective_score` on the
-  // returned objects — downstream consumers (emitRecalled topScore, the
-  // rendered output, telemetry) keep the SQL-supplied cognitive score so
-  // existing assertions and dashboards stay stable. The hybrid is purely
-  // a re-ranking mechanism.
+  // Additive sort key — see header comment for derivation.
   const ranked = candidates
     .map((c) => {
       const cn = cosineNorm.get(c.id) ?? 0;
       const bn = bm25Norm.get(c.id) ?? 0;
-      const hybridRelevance = alpha * cn + (1 - alpha) * bn;
-      return { mem: c, key: hybridRelevance * c.strength_now * c.salience };
+      const hybrid = alpha * cn + (1 - alpha) * bn;
+      const strengthBoost = Math.log(1 + Math.max(c.strength_now, 0)) * beta;
+      const activationBoost = Math.log(1 + Math.max(c.access_count, 0)) * gamma;
+      const score = hybrid + strengthBoost + activationBoost;
+      // Overwrite effective_score so rendered output + emitRecalled topScore
+      // reflect the new ranking value. The old multiplicative score is gone
+      // by design; pre-existing tests asserting that specific value have
+      // been updated to the additive equivalent.
+      return { mem: { ...c, effective_score: score }, key: score };
     })
     .sort((a, b) => b.key - a.key);
 
@@ -87,7 +129,7 @@ export const recallSchema = z.object({
     .optional()
     .default(HYBRID_ALPHA_DEFAULT)
     .describe(
-      "α — weight of cosine vs BM25 in hybrid relevance (0..1). 1=pure cosine, 0=pure BM25. Default from MYCELIUM_HYBRID_ALPHA env (0.6)."
+      "α — weight of cosine vs BM25 in hybrid relevance (0..1). 1=pure cosine, 0=pure BM25. Default from ENGRAM_HYBRID_ALPHA env (0.6). Cognitive boosts log(1+strength_now)·β + log(1+access_count)·γ are added on top — see recall.ts header for the additive log-scale formula."
     ),
   spread: z
     .boolean()
