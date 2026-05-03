@@ -532,4 +532,59 @@ export class MemoryService {
     if (error) throw new Error(`Failed to list memories: ${fmtErr(error)}`);
     return (data ?? []) as Memory[];
   }
+
+  /**
+   * Scoped memory listing for R2 destructive ops (dedup_memories,
+   * forget_weak_memories) — returns only memories matching the provided
+   * scope. At least one of {tag, project, ids} must be set; returning the
+   * full table here would defeat the safety contract of the scope params.
+   * `includeArchived` defaults to false so already-archived rows aren't
+   * re-archived by mistake.
+   */
+  async listByScope(scope: {
+    tag?: string;
+    project?: string | null;
+    ids?: string[];
+    includeArchived?: boolean;
+    limit?: number;
+  }): Promise<Memory[]> {
+    if (!scope.tag && scope.project === undefined && (!scope.ids || scope.ids.length === 0)) {
+      throw new Error(
+        "listByScope requires at least one of {tag, project, ids} — empty scope is not allowed"
+      );
+    }
+    let query = this.db
+      .from("memories")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(scope.limit ?? 1000);
+
+    if (!scope.includeArchived) query = query.neq("stage", "archived");
+    if (scope.tag) query = query.contains("tags", [scope.tag]);
+    if (scope.project !== undefined) {
+      // null/undefined are distinct: project=null means "memories without
+      // a project assigned"; project="<uuid>" means that specific project.
+      if (scope.project === null) query = query.is("project_id", null);
+      else query = query.eq("project_id", scope.project);
+    }
+    if (scope.ids && scope.ids.length > 0) query = query.in("id", scope.ids);
+
+    const { data, error } = await query;
+    if (error) throw new Error(`Failed to list by scope: ${fmtErr(error)}`);
+    return (data ?? []) as Memory[];
+  }
+
+  /**
+   * Soft-delete a single memory by setting stage='archived'. Mirrors the
+   * server-side semantics of dedup_similar_memories / forget_weak_memories
+   * RPCs (which archive rather than hard-delete) so scoped destructive ops
+   * are recoverable. Hard delete is available via .delete(id).
+   */
+  async archive(id: string): Promise<void> {
+    const { error } = await this.db
+      .from("memories")
+      .update({ stage: "archived" })
+      .eq("id", id);
+    if (error) throw new Error(`Failed to archive memory ${id}: ${fmtErr(error)}`);
+  }
 }

@@ -31,7 +31,7 @@ Mycelium core architecture, MCP tool schemas, Supabase migrations, and cognitive
 - [x] Score formula refactor R1 (additive log-scale) — see `docs/engram-scoring.md`
 - [x] Empty query validation R6 (zod `min(1).max(2000)` on recall query)
 - [x] Recall response format param R4 partial (`metadata` / `snippet` / `full`, default `snippet`)
-- [ ] Scoping params for destructive tools R2
+- [x] Scoping params for destructive tools R2 (HIGH-5 + LOW-1) — `dedup_memories`, `forget_weak_memories` with scope_tag/project/ids + dry_run default true
 
 ### Phase 2 — Production hardening
 - [ ] Concurrent write safety R3 (server-side write queue)
