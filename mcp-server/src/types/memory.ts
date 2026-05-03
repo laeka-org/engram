@@ -75,6 +75,24 @@ export interface CreateMemoryInput {
   project_id?: string | null;
 }
 
+/** Information about a near-duplicate hit during memory creation.
+ *  Surfaced via createWithDedupInfo() when an incoming write was merged into
+ *  an existing memory rather than creating a new one (R4 transparency fix —
+ *  HIGH-4 from stress-test handoff 2026-05-03). */
+export interface DedupInfo {
+  existing_id: string;
+  similarity_score: number;
+  existing_content: string;
+}
+
+/** Result of a memory creation attempt. When `deduped` is set, the returned
+ *  `memory` is an EXISTING memory the new content was merged into; the new
+ *  content was NOT persisted as a separate row (R4 transparency). */
+export interface CreateMemoryResult {
+  memory: Memory;
+  deduped?: DedupInfo;
+}
+
 export interface UpdateMemoryInput {
   id: string;
   content?: string;

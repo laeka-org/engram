@@ -34,8 +34,8 @@ Mycelium core architecture, MCP tool schemas, Supabase migrations, and cognitive
 - [x] Scoping params for destructive tools R2 (HIGH-5 + LOW-1) — `dedup_memories`, `forget_weak_memories` with scope_tag/project/ids + dry_run default true
 
 ### Phase 2 — Production hardening
-- [ ] Concurrent write safety R3 (server-side write queue)
-- [ ] Near-dup dedup transparency R4 (`force_new`, `dedup_to_existing` flags)
+- [x] Near-dup dedup transparency R4 (`force_new` param + `dedup_to_existing`/`existing_id`/`similarity_score` response fields)
+- [x] R3 scope re-evaluated → HIGH-3 (parallel data loss) was HIGH-4 manifestation on near-dup content; no per-session write queue needed. Distinct-content parallel writes deterministic post-fix (proven via 3-call parallel test).
 - [ ] Affect-narrowing transparency (HIGH-2 — explicit `actual_limit_applied` field)
 
 ### Phase 3 — Public surface

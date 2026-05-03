@@ -85,6 +85,11 @@ class FakeService implements Partial<MemoryService> {
     return makeMemory({ ...input, content: input.content });
   }
 
+  async createWithDedupInfo(input: CreateMemoryInput): Promise<{ memory: Memory; deduped?: undefined }> {
+    const memory = await this.create(input);
+    return { memory };
+  }
+
   async search(query: string): Promise<MemorySearchResult[]> {
     this.searched.push(query);
     return this.opts.searchResults ?? [];
@@ -138,6 +143,7 @@ test("remember returns id and category in text", async () => {
     content: "the sky is blue",
     category: "topics",
     tags: [],
+    force_new: false,
   });
   assert.match(res.content[0].text, /Remembered \(topics/);
   assert.match(res.content[0].text, /the sky is blue/);
@@ -152,6 +158,7 @@ test("remember truncates long content in output", async () => {
     content: long,
     category: "general",
     tags: [],
+    force_new: false,
   });
   assert.match(res.content[0].text, /\.\.\./);
 });

@@ -5,6 +5,7 @@ import type {
   SpreadResult,
   CrossSpreadResult,
   CreateMemoryInput,
+  CreateMemoryResult,
   UpdateMemoryInput,
 } from "../types/memory.js";
 import type { EmbeddingProvider } from "./embeddings.js";
@@ -179,16 +180,57 @@ export class MemoryService {
     return results.filter((r) => r.relevance >= threshold);
   }
 
+  /** Back-compat wrapper: returns just the Memory, drops dedup info.
+   *  Existing callers (import.ts, absorb.ts, digest.ts) keep working unchanged. */
   async create(input: CreateMemoryInput): Promise<Memory> {
-    const duplicates = await this.findSimilar(input.content);
-    if (duplicates.length > 0) {
-      console.error(
-        `Skipped near-duplicate (relevance ${duplicates[0].relevance.toFixed(3)}) of memory ${duplicates[0].id} — touching it instead`
-      );
-      // Rehearse the existing trace rather than create a duplicate.
-      await this.touch([duplicates[0].id]);
-      const existing = await this.get(duplicates[0].id);
-      if (existing) return existing;
+    const result = await this.createWithDedupInfo(input);
+    return result.memory;
+  }
+
+  /** Memory creation with explicit dedup transparency (R4 — HIGH-4 fix from
+   *  stress-test handoff 2026-05-03). When the incoming content is a near-
+   *  duplicate of an existing memory (cosine ≥ 0.92), the existing memory is
+   *  returned with `deduped` populated so the caller can signal the merge to
+   *  the user instead of silently pretending success on net-new content.
+   *  Pass `opts.force_new = true` to bypass the dedup check entirely and
+   *  always insert a new row.
+   *
+   *  Note on HIGH-3 (parallel write data loss reported in stress-test): the
+   *  observed bug was actually HIGH-4 manifesting on near-duplicate parallel
+   *  writes (e.g. ADOPTED + REJECTED, cosine ≥ 0.95). Once HIGH-4 is fixed
+   *  with explicit `deduped` signaling, parallel writes with distinct content
+   *  produce distinct UUIDs deterministically (each goes through findSimilar
+   *  → no hit → independent insert). No per-session write queue is needed.
+   *  The remaining race window (T0 findSimilar A → T1 findSimilar B → T2
+   *  insert A → T3 insert B with similar content) produces TWO rows, not the
+   *  observed "both responses share one UUID" bug; that scenario is the
+   *  classic dedup race and is left to a future stronger guarantee (DB-level
+   *  unique constraint on content hash) outside R3 scope. */
+  async createWithDedupInfo(
+    input: CreateMemoryInput,
+    opts?: { force_new?: boolean }
+  ): Promise<CreateMemoryResult> {
+    if (!opts?.force_new) {
+      const duplicates = await this.findSimilar(input.content);
+      if (duplicates.length > 0) {
+        const hit = duplicates[0];
+        console.error(
+          `Skipped near-duplicate (relevance ${hit.relevance.toFixed(3)}) of memory ${hit.id} — touching it instead`
+        );
+        // Rehearse the existing trace rather than create a duplicate.
+        await this.touch([hit.id]);
+        const existing = await this.get(hit.id);
+        if (existing) {
+          return {
+            memory: existing,
+            deduped: {
+              existing_id: existing.id,
+              similarity_score: hit.relevance,
+              existing_content: existing.content,
+            },
+          };
+        }
+      }
     }
 
     const embedding = await this.embeddings.embed(input.content);
@@ -241,7 +283,7 @@ export class MemoryService {
       console.error("Auto-link / interference failed (non-fatal):", err);
     }
 
-    return memory;
+    return { memory };
   }
 
   /** Interference: weaken the k nearest existing memories when a new one is encoded. */
