@@ -3,12 +3,75 @@ import { randomUUID } from "node:crypto";
 import type { MemoryService } from "../services/supabase.js";
 import { AffectService } from "../services/affect.js";
 import type { ProjectService } from "../services/projects.js";
+import type { MemorySearchResult } from "../types/memory.js";
+import { bm25Score, normalizeScores } from "../services/bm25.js";
 
 // Layer-0 (Bedrock) + Layer-1 (per-role) recall — opt-in via env flag.
 // When MYCELIUM_PRIVATE_BY_DEFAULT=1, recall scopes results to the agent's
 // active project, with pinned memories (Bedrock) still surfacing globally.
 // Without the flag, behaviour is unchanged: every memory is visible.
 const PRIVATE_BY_DEFAULT = process.env.MYCELIUM_PRIVATE_BY_DEFAULT === "1";
+
+// Hybrid retrieval — blend cosine + BM25 to fix vocab-divergent blind spots
+// (query "ordi" vs memory "serveur Dell": same hardware, different words).
+// SQL match_memories_cognitive already exposes a vector_weight knob, but its
+// FTS branch uses to_tsvector('german', ...) (migration 060), which scores
+// near-zero on FR/EN content. We bypass that path by passing vector_weight=1.0
+// to SQL (pure cosine relevance, wider candidate pool) and re-rank in TS
+// with Okapi BM25 over the candidate content.
+const HYBRID_ALPHA_DEFAULT = ((): number => {
+  const raw = process.env.MYCELIUM_HYBRID_ALPHA;
+  if (raw === undefined) return 0.6;
+  const v = parseFloat(raw);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.6;
+})();
+const CANDIDATE_POOL_MULTIPLIER = 3;
+const CANDIDATE_POOL_FLOOR = 30;
+
+function rerankHybrid(
+  candidates: MemorySearchResult[],
+  query: string,
+  alpha: number,
+  limit: number
+): MemorySearchResult[] {
+  if (candidates.length === 0) return candidates;
+  // Single-item pool or pure cosine → nothing to re-rank. SQL already
+  // returned the cognitive-cosine ordering.
+  if (candidates.length <= 1 || alpha >= 1) return candidates.slice(0, limit);
+
+  const bm25 = bm25Score(
+    query,
+    candidates.map((c) => ({ id: c.id, text: c.content }))
+  );
+  const bm25Norm = new Map(normalizeScores(bm25).map((s) => [s.id, s.score]));
+
+  // SQL was called with vector_weight=1.0, so `relevance` IS the raw cosine
+  // similarity (1 − distance). Min-max within the pool so both signals share
+  // scale before blending.
+  const cosineNorm = new Map(
+    normalizeScores(
+      candidates.map((c) => ({ id: c.id, score: c.relevance }))
+    ).map((s) => [s.id, s.score])
+  );
+
+  // Sort key = hybrid relevance × strength_now × salience. The cognitive
+  // multipliers preserve recency/usage/pinned biasing on top of the new
+  // keyword+vector blend. We do NOT overwrite `effective_score` on the
+  // returned objects — downstream consumers (emitRecalled topScore, the
+  // rendered output, telemetry) keep the SQL-supplied cognitive score so
+  // existing assertions and dashboards stay stable. The hybrid is purely
+  // a re-ranking mechanism.
+  const ranked = candidates
+    .map((c) => {
+      const cn = cosineNorm.get(c.id) ?? 0;
+      const bn = bm25Norm.get(c.id) ?? 0;
+      const hybridRelevance = alpha * cn + (1 - alpha) * bn;
+      return { mem: c, key: hybridRelevance * c.strength_now * c.salience };
+    })
+    .sort((a, b) => b.key - a.key);
+
+  return ranked.slice(0, limit).map((r) => r.mem);
+}
 
 export const recallSchema = z.object({
   query: z.string().describe("What to search for (semantic + keyword)"),
@@ -22,8 +85,10 @@ export const recallSchema = z.object({
     .min(0)
     .max(1)
     .optional()
-    .default(0.6)
-    .describe("Weight for vector vs full-text search (0..1). Used inside relevance only."),
+    .default(HYBRID_ALPHA_DEFAULT)
+    .describe(
+      "α — weight of cosine vs BM25 in hybrid relevance (0..1). 1=pure cosine, 0=pure BM25. Default from MYCELIUM_HYBRID_ALPHA env (0.6)."
+    ),
   spread: z
     .boolean()
     .optional()
@@ -95,12 +160,24 @@ export async function recall(
     }
   }
 
-  const results = await service.search(
+  // Pull a wider candidate pool with pure-cosine relevance (vector_weight=1.0
+  // bypasses migration 060's german-FTS branch), then re-rank in TS with BM25.
+  const poolSize = Math.max(
+    effectiveLimit * CANDIDATE_POOL_MULTIPLIER,
+    CANDIDATE_POOL_FLOOR
+  );
+  const candidates = await service.search(
     input.query,
     input.category,
-    effectiveLimit,
-    input.vector_weight,
+    poolSize,
+    1.0,
     scope
+  );
+  const results = rerankHybrid(
+    candidates,
+    input.query,
+    input.vector_weight,
+    effectiveLimit
   );
 
   // ---- Observability: emit a `recalled` memory_event ----------------------
