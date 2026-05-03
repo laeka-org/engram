@@ -217,6 +217,7 @@ test("recall hybrid: Dell memory surfaces in top-3 under additive scoring (Saphi
       with_experiences: false,
       ignore_affect: true,
       cite: false,
+      format: "snippet",
     }
   );
 
@@ -251,6 +252,7 @@ test("recall hybrid: α=1.0 ranks exactly like pure cosine", async () => {
       with_experiences: false,
       ignore_affect: true,
       cite: false,
+      format: "snippet",
     }
   );
   const top = idsFromOutput((out.content[0] as { text: string }).text);
@@ -278,6 +280,7 @@ test("recall hybrid: α=0.0 ranks exactly like pure BM25", async () => {
       with_experiences: false,
       ignore_affect: true,
       cite: false,
+      format: "snippet",
     }
   );
   const top = idsFromOutput((out.content[0] as { text: string }).text);
@@ -299,6 +302,7 @@ test("recall hybrid: empty candidate pool → 'No matching memories found'", asy
       with_experiences: false,
       ignore_affect: true,
       cite: false,
+      format: "snippet",
     }
   );
   const text = (out.content[0] as { text: string }).text;

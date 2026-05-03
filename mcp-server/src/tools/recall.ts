@@ -116,7 +116,11 @@ export function rerankHybrid(
 }
 
 export const recallSchema = z.object({
-  query: z.string().describe("What to search for (semantic + keyword)"),
+  query: z
+    .string()
+    .min(1, "Query cannot be empty")
+    .max(2000, "Query too long, max 2000 chars")
+    .describe("What to search for (semantic + keyword)"),
   category: z
     .enum(["general", "people", "projects", "topics", "decisions"])
     .optional()
@@ -156,6 +160,13 @@ export const recallSchema = z.object({
     .default(false)
     .describe(
       "Set true when the retrieved memories will actually inform the response. Emits one `used_in_response` event per top-5 hit with a shared trace_id — the CoactivationAgent then Hebbian-links them pairwise. Opt-in to keep signal quality: purely exploratory recalls should leave this off."
+    ),
+  format: z
+    .enum(["metadata", "snippet", "full"])
+    .optional()
+    .default("snippet")
+    .describe(
+      "Output verbosity. metadata: id/score/category/tags/created_at/strength/ax only — no content body, lowest tokens, also skips experiences fetch. snippet (default): content truncated to 200 chars + ellipsis if longer. full: complete content (legacy behavior, opt-in for high-detail recalls — large memories may exceed caller context budget)."
     ),
 });
 
@@ -259,7 +270,9 @@ export async function recall(
     id: string; summary: string; outcome: string;
     difficulty: number; valence: number; weight: number; created_at: string;
   }>>();
-  if (input.with_experiences) {
+  // Skip experiences fetch in metadata mode — they're not rendered, no point
+  // paying the network cost.
+  if (input.with_experiences && input.format !== "metadata") {
     const overlays = await Promise.all(
       topForOverlay.map((r) => service.experiencesForMemory(r.id, 2))
     );
@@ -268,10 +281,27 @@ export async function recall(
     });
   }
 
+  // Output verbosity branches (R4 partial — MED-5 from stress-test handoff
+  // 2026-05-03). metadata = id/score/tags/timestamp only; snippet (default) =
+  // 200-char body cap + ellipsis; full = legacy behavior, opt-in for callers
+  // that genuinely need full memory content.
+  const SNIPPET_MAX = 200;
   const formatted = results
     .map((r, i) => {
       const stageMark = r.pinned ? "*" : r.stage === "semantic" ? "S" : "e";
-      const head = `${i + 1}. [${r.category}/${stageMark}] score=${r.effective_score.toFixed(3)} (rel=${r.relevance.toFixed(2)} str=${r.strength_now.toFixed(2)} sal=${r.salience.toFixed(2)} ax=${r.access_count})\n   ${r.content}\n   id: ${r.id}${r.tags.length ? " | tags: " + r.tags.join(", ") : ""}`;
+      const stats = `[${r.category}/${stageMark}] score=${r.effective_score.toFixed(3)} (rel=${r.relevance.toFixed(2)} str=${r.strength_now.toFixed(2)} sal=${r.salience.toFixed(2)} ax=${r.access_count})`;
+      const tagSuffix = r.tags.length ? " | tags: " + r.tags.join(", ") : "";
+
+      if (input.format === "metadata") {
+        return `${i + 1}. ${stats}\n   id: ${r.id} | created: ${r.created_at}${tagSuffix}`;
+      }
+
+      const body =
+        input.format === "full" || r.content.length <= SNIPPET_MAX
+          ? r.content
+          : r.content.slice(0, SNIPPET_MAX) + "...";
+      const head = `${i + 1}. ${stats}\n   ${body}\n   id: ${r.id}${tagSuffix}`;
+
       const exps = experiencesByMemory.get(r.id);
       if (!exps || exps.length === 0) return head;
       const lived = exps
@@ -288,10 +318,13 @@ export async function recall(
 
   if (crossNeighbors.length > 0) {
     const assoc = crossNeighbors
-      .map(
-        (n, i) =>
-          `${i + 1}. [${n.kind}/${n.category}] link=${n.link_strength.toFixed(2)} ${(n.content ?? "").slice(0, 120)}\n   id: ${n.id}`
-      )
+      .map((n, i) => {
+        const head = `${i + 1}. [${n.kind}/${n.category}] link=${n.link_strength.toFixed(2)}`;
+        if (input.format === "metadata") {
+          return `${head}\n   id: ${n.id}`;
+        }
+        return `${head} ${(n.content ?? "").slice(0, 120)}\n   id: ${n.id}`;
+      })
       .join("\n\n");
     text += `\n\nAssociated (spreading activation, cross-kind):\n\n${assoc}`;
   }

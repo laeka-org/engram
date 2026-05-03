@@ -29,13 +29,13 @@ Mycelium core architecture, MCP tool schemas, Supabase migrations, and cognitive
 - [x] Stress-test report (14 findings, 6 HIGH severity)
 - [x] Brand identity established
 - [x] Score formula refactor R1 (additive log-scale) — see `docs/engram-scoring.md`
-- [ ] Empty query validation R6
+- [x] Empty query validation R6 (zod `min(1).max(2000)` on recall query)
+- [x] Recall response format param R4 partial (`metadata` / `snippet` / `full`, default `snippet`)
 - [ ] Scoping params for destructive tools R2
 
 ### Phase 2 — Production hardening
 - [ ] Concurrent write safety R3 (server-side write queue)
 - [ ] Near-dup dedup transparency R4 (`force_new`, `dedup_to_existing` flags)
-- [ ] Recall response format param R4 (`metadata` / `snippet` / `full`)
 - [ ] Affect-narrowing transparency (HIGH-2 — explicit `actual_limit_applied` field)
 
 ### Phase 3 — Public surface
