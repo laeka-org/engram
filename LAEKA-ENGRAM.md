@@ -36,7 +36,7 @@ Mycelium core architecture, MCP tool schemas, Supabase migrations, and cognitive
 ### Phase 2 — Production hardening
 - [x] Near-dup dedup transparency R4 (`force_new` param + `dedup_to_existing`/`existing_id`/`similarity_score` response fields)
 - [x] R3 scope re-evaluated → HIGH-3 (parallel data loss) was HIGH-4 manifestation on near-dup content; no per-session write queue needed. Distinct-content parallel writes deterministic post-fix (proven via 3-call parallel test).
-- [ ] Affect-narrowing transparency (HIGH-2 — explicit `actual_limit_applied` field)
+- [x] R5 temporal recency + activation cap + HIGH-2 affect transparency — `recency_weight` param (FR/EN auto-detect → 0.5), `min(access_count, 20)` cap, `_meta.actual_limit_applied`/`affect_narrowed`/`affect_state` structured fields
 
 ### Phase 3 — Public surface
 - [ ] Landing at `laeka.ai/engram`

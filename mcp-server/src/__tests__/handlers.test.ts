@@ -173,6 +173,7 @@ test("recall returns 'no matching' when empty", async () => {
     ignore_affect: true,
     cite: false,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.match(res.content[0].text, /No matching memories/);
 });
@@ -207,6 +208,7 @@ test("recall formats results with rank, score and id", async () => {
     ignore_affect: true,
     cite: false,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.match(res.content[0].text, /Found 1 memories/);
   assert.match(res.content[0].text, /1\. \[people\//);
@@ -224,6 +226,7 @@ test("recall emits recalled memory_event with hits=0 on empty result", async () 
     ignore_affect: true,
     cite: false,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.equal(svc.recalledEvents.length, 1);
   const ev = svc.recalledEvents[0];
@@ -280,6 +283,7 @@ test("recall emits recalled memory_event with hit count and top score", async ()
     ignore_affect: true,
     cite: false,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.equal(svc.recalledEvents.length, 1);
   const ev = svc.recalledEvents[0];
@@ -341,6 +345,7 @@ test("recall(cite=true) with ≥2 hits emits used_in_response with shared trace_
     ignore_affect: true,
     cite: true,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.equal(svc.usedInResponseCalls.length, 1);
   const call = svc.usedInResponseCalls[0];
@@ -360,6 +365,7 @@ test("recall(cite=true) with 1 hit does NOT emit used_in_response (gate: ≥2)",
     ignore_affect: true,
     cite: true,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.equal(svc.usedInResponseCalls.length, 0);
 });
@@ -377,6 +383,7 @@ test("recall(cite=false) never emits used_in_response even with many hits", asyn
     ignore_affect: true,
     cite: false,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.equal(svc.usedInResponseCalls.length, 0);
 });
@@ -394,6 +401,7 @@ test("recall(cite=true) caps used_in_response to first 5 hits", async () => {
     ignore_affect: true,
     cite: true,
     format: "snippet",
+      recency_weight: 0,
   });
   assert.equal(svc.usedInResponseCalls.length, 1);
   assert.equal(svc.usedInResponseCalls[0].ids.length, 5);

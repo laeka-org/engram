@@ -11,8 +11,9 @@ generic query, swamping the BM25 keyword gain on real DBs.
 
 ```
 final = (α · cosine_norm) + ((1 − α) · bm25_norm)
-      + log(1 + strength_now)  · β
-      + log(1 + access_count)  · γ
+      + log(1 + strength_now)            · β
+      + log(1 + min(access_count, 20))   · γ
+      + exp(-age_days / 30) · recency_weight
 ```
 
 - **`cosine_norm`** — pgvector cosine similarity (`1 − distance`),
@@ -23,14 +24,41 @@ final = (α · cosine_norm) + ((1 − α) · bm25_norm)
 - **`strength_now`** — time-decayed strength from
   `match_memories_cognitive` (Mycelium migration 060).
 - **`access_count`** — total recalls since memory creation.
+  **Capped at 20** (R5/MED-4) so that very high-activation memories
+  don't keep dominating recall via the feedback loop where being
+  recalled once raises the chance of being recalled again.
+- **`age_days`** — `(now − created_at) / 86_400_000`, lower-bounded at 0.
+- **`recency_weight`** — caller-supplied or auto-detected (see below).
+  Defaults to 0 (no recency boost). When > 0, fresher memories get a
+  bounded `exp(-age_days/30) · weight` bonus.
 - **`α, β, γ`** — env-configurable (see below).
 
 The log compression caps cognitive boost: even a memory with
 `strength=60, ax=100` contributes at most
-`log(61)·0.1 + log(101)·0.05 ≈ 0.41 + 0.23 = 0.64`, vs the
+`log(61)·0.1 + log(min(100,20)+1)·0.05 ≈ 0.41 + 0.15 = 0.56`, vs the
 hybrid term which is `[0, 1]` and dominates ranking. Cognitive
 history thus *nudges* ranking but cannot *override* a strong
 semantic match.
+
+### Recency auto-detection (R5 / MED-2)
+
+When `recency_weight` is left at its default 0 AND the query carries
+an FR or EN temporal keyword, recall sets an implicit `recency_weight = 0.5`
+for the call only. Caller-supplied values (any non-zero) always win and
+disable auto-detection.
+
+Auto-detected keyword set (single regex, < 1ms per query):
+
+- **FR** — `récemment`, `récent` / `récents` / `récente` / `récentes`,
+  `hier`, `aujourd'hui` / `aujourd hui`, `cette semaine`,
+  `la semaine passée`.
+- **EN** — `recent`, `recently`, `today`, `yesterday`,
+  `past week`, `last week`.
+
+The structured `_meta.recency_applied` field on the recall response
+exposes both the effective weight and whether it was auto-detected
+(`{ weight: 0.5, auto_detected: true }`), so automated callers can
+audit the behaviour without parsing text.
 
 ## Env vars
 

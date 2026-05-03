@@ -151,6 +151,7 @@ test("recall format=metadata: no body content in output, no experiences fetched 
       ignore_affect: true,
       cite: false,
       format: "metadata",
+      recency_weight: 0,
     }
   );
   const text = (out.content[0] as { text: string }).text;
@@ -195,6 +196,7 @@ test("recall format=snippet: content truncated to 200 chars + ellipsis (default)
       ignore_affect: true,
       cite: false,
       format: "snippet",
+      recency_weight: 0,
     }
   );
   const text = (out.content[0] as { text: string }).text;
@@ -238,6 +240,7 @@ test("recall format=full: full content preserved (back-compat with legacy caller
       ignore_affect: true,
       cite: false,
       format: "full",
+      recency_weight: 0,
     }
   );
   const text = (out.content[0] as { text: string }).text;

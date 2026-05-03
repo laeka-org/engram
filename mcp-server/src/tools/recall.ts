@@ -59,13 +59,40 @@ const ACTIVATION_GAMMA_DEFAULT = readEnvFloat("ENGRAM_ACTIVATION_GAMMA", 0.05, 0
 const CANDIDATE_POOL_MULTIPLIER = 3;
 const CANDIDATE_POOL_FLOOR = 30;
 
+// R5 — temporal recency boost + activation cap (MED-2 + MED-4).
+// Recency uses an exponential half-life of ~30 days (RECENCY_TAU_DAYS),
+// so a 30-day-old memory contributes exp(-1) ≈ 0.37 of its weight, a
+// 90-day-old one ≈ 0.05. Activation contribution is capped at 20: past
+// that point further accesses no longer boost the score, breaking the
+// feedback loop where high-activation memories stay high-activation
+// because they keep getting recalled (stress-test §MED-4).
+const RECENCY_TAU_DAYS = 30;
+const ACTIVATION_CAP = 20;
+
+// Auto-detect "the user is asking about recent stuff" — single regex,
+// case-insensitive, FR + EN. Performance budget per brief: < 1ms.
+const TEMPORAL_INTENT_RE =
+  /\b(récemment|récent[es]?|hier|aujourd['’ ]?hui|cette\s+semaine|la\s+semaine\s+passée|recent(ly)?|today|yesterday|past\s+week|last\s+week)\b/iu;
+
+export function detectTemporalIntent(query: string): boolean {
+  return TEMPORAL_INTENT_RE.test(query);
+}
+
+function ageDays(createdAt: string, nowMs: number): number {
+  const createdMs = new Date(createdAt).getTime();
+  if (!Number.isFinite(createdMs)) return 0;
+  return Math.max(0, (nowMs - createdMs) / 86_400_000);
+}
+
 export function rerankHybrid(
   candidates: MemorySearchResult[],
   query: string,
   alpha: number,
   limit: number,
   beta: number = STRENGTH_BETA_DEFAULT,
-  gamma: number = ACTIVATION_GAMMA_DEFAULT
+  gamma: number = ACTIVATION_GAMMA_DEFAULT,
+  recencyWeight: number = 0,
+  nowMs: number = Date.now()
 ): MemorySearchResult[] {
   if (candidates.length === 0) return candidates;
   // Single-item pool — nothing to re-rank. Preserve SQL's effective_score
@@ -96,14 +123,23 @@ export function rerankHybrid(
   );
 
   // Additive sort key — see header comment for derivation.
+  // Activation contribution is capped at 20 (R5/MED-4) to break the feedback
+  // loop where high-ax memories stay high-ax because they keep getting picked.
+  // Recency adds an optional exp(-age_days/τ)·recencyWeight term (R5/MED-2).
   const ranked = candidates
     .map((c) => {
       const cn = cosineNorm.get(c.id) ?? 0;
       const bn = bm25Norm.get(c.id) ?? 0;
       const hybrid = alpha * cn + (1 - alpha) * bn;
       const strengthBoost = Math.log(1 + Math.max(c.strength_now, 0)) * beta;
-      const activationBoost = Math.log(1 + Math.max(c.access_count, 0)) * gamma;
-      const score = hybrid + strengthBoost + activationBoost;
+      const cappedAx = Math.min(Math.max(c.access_count, 0), ACTIVATION_CAP);
+      const activationBoost = Math.log(1 + cappedAx) * gamma;
+      const recencyBoost =
+        recencyWeight > 0
+          ? Math.exp(-ageDays(c.created_at, nowMs) / RECENCY_TAU_DAYS) *
+            recencyWeight
+          : 0;
+      const score = hybrid + strengthBoost + activationBoost + recencyBoost;
       // Overwrite effective_score so rendered output + emitRecalled topScore
       // reflect the new ranking value. The old multiplicative score is gone
       // by design; pre-existing tests asserting that specific value have
@@ -168,6 +204,15 @@ export const recallSchema = z.object({
     .describe(
       "Output verbosity. metadata: id/score/category/tags/created_at/strength/ax only — no content body, lowest tokens, also skips experiences fetch. snippet (default): content truncated to 200 chars + ellipsis if longer. full: complete content (legacy behavior, opt-in for high-detail recalls — large memories may exceed caller context budget)."
     ),
+  recency_weight: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .default(0)
+    .describe(
+      "R5/MED-2 — temporal recency boost coefficient (0..1, default 0). When > 0, adds exp(-age_days/30)·recency_weight to each candidate's score, surfacing fresh memories. If left at 0, recall auto-detects temporal intent in the query (FR: récemment/hier/aujourd'hui/cette semaine; EN: recent/recently/today/yesterday/past week) and applies an implicit weight of 0.5. Set explicitly to override either way."
+    ),
 });
 
 export async function recall(
@@ -195,9 +240,21 @@ export async function recall(
   // ---- Affective biasing --------------------------------------------------
   // Pull the current state and translate it into small deltas on k and
   // spread behaviour. Failure to read affect is non-fatal (returns null).
+  // R5 / HIGH-2 — capture affectMeta so the response can expose the actual
+  // limit applied + structured affect_state alongside the human-readable
+  // footer. Automated callers should read response._meta, not parse text.
   let effectiveLimit = input.limit;
   let effectiveSpread = input.spread;
   let biasNote = "";
+  let affectMeta:
+    | {
+        satisfaction: number;
+        reason: string;
+        k_delta: number;
+        score_threshold: number | null;
+        spread_wide: boolean;
+      }
+    | null = null;
   if (!input.ignore_affect) {
     try {
       const state = await affect.get();
@@ -206,12 +263,27 @@ export async function recall(
       if (bias.spread_wide) effectiveSpread = true;
       if (bias.reason !== "neutral") {
         biasNote = `\n\n[affect] ${bias.reason} → limit ${input.limit}→${effectiveLimit}${effectiveSpread && !input.spread ? ", spread forced on" : ""}`;
+        affectMeta = {
+          satisfaction: state.satisfaction,
+          reason: bias.reason,
+          k_delta: bias.k_delta,
+          score_threshold: bias.score_threshold,
+          spread_wide: bias.spread_wide,
+        };
       }
     } catch (err) {
       // Affect unreachable → run plain. Don't block the user's query.
       console.error("recall: affect lookup failed (non-fatal):", err);
     }
   }
+
+  // ---- Temporal recency (R5 / MED-2) -------------------------------------
+  // recency_weight=0 (default) + temporal-keyword query → implicit 0.5.
+  // Caller can force recency_weight=0 explicitly by setting it; we only
+  // auto-detect when the value is exactly the schema default.
+  const recencyAutoDetected =
+    input.recency_weight === 0 && detectTemporalIntent(input.query);
+  const recencyWeight = recencyAutoDetected ? 0.5 : input.recency_weight;
 
   // Pull a wider candidate pool with pure-cosine relevance (vector_weight=1.0
   // bypasses migration 060's german-FTS branch), then re-rank in TS with BM25.
@@ -230,7 +302,10 @@ export async function recall(
     candidates,
     input.query,
     input.vector_weight,
-    effectiveLimit
+    effectiveLimit,
+    /* beta */ undefined,
+    /* gamma */ undefined,
+    recencyWeight
   );
 
   // ---- Observability: emit a `recalled` memory_event ----------------------
@@ -240,8 +315,26 @@ export async function recall(
   const topScore = results[0]?.effective_score ?? 0;
   void service.emitRecalled(results.length, topScore, input.query.length, "mcp:recall");
 
+  // ---- R5 / HIGH-2 — structured response metadata ------------------------
+  // _meta surfaces what affect actually did + what recency was applied so
+  // automated callers don't have to parse the human footer. Always present
+  // (even on empty results, so downstream code can rely on the shape).
+  const _meta = {
+    requested_limit: input.limit,
+    actual_limit_applied: effectiveLimit,
+    affect_narrowed: effectiveLimit < input.limit,
+    affect_state: affectMeta,
+    recency_applied:
+      recencyWeight > 0
+        ? { weight: recencyWeight, auto_detected: recencyAutoDetected }
+        : null,
+  };
+
   if (results.length === 0) {
-    return { content: [{ type: "text" as const, text: "No matching memories found." }] };
+    return {
+      content: [{ type: "text" as const, text: "No matching memories found." }],
+      _meta,
+    };
   }
 
   // Rehearsal (testing effect) + Hebbian co-activation of the top results.
@@ -333,5 +426,8 @@ export async function recall(
     ? `\n\n[cite] emitted used_in_response for ${citedIds.length} memories (trace=${citeTrace.slice(0, 8)}) — CoactivationAgent will pairwise link after 30s debounce.`
     : "";
 
-  return { content: [{ type: "text" as const, text: text + biasNote + citeNote }] };
+  return {
+    content: [{ type: "text" as const, text: text + biasNote + citeNote }],
+    _meta,
+  };
 }
