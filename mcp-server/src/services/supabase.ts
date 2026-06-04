@@ -16,6 +16,7 @@ import type {
   VerdictContext,
   IntegrityVerdict,
   VerdictDeps,
+  VerdictAuditEntry,
 } from "./verdict.js";
 
 /**
@@ -194,7 +195,50 @@ export class MemoryService {
         : {},
     });
     this.embeddings = embeddings;
-    this.verdictDeps = verdictDeps;
+    // Default the verdict audit sink to memory_events (STEP 3) unless the caller
+    // injected one (tests do). The sink is db-bound so MemoryService stays the
+    // single owner of the DB client — verdict() never sees a raw client, only
+    // the persistAudit callback. audit_id then resolves to a real memory_events
+    // row (conformance §11.2).
+    this.verdictDeps = {
+      ...verdictDeps,
+      persistAudit: verdictDeps.persistAudit ?? ((entry) => this.persistVerdictAudit(entry)),
+    };
+  }
+
+  /**
+   * Persist one verdict audit row into memory_events (event_type='verdict',
+   * migration 086) and return its id — that id is the IntegrityVerdict.audit_id
+   * (conformance §11.2: every audit_id resolves to a real memory_events row).
+   *
+   * The full E/S/A lens trace + Monade synthesis is the moat (contract §3) and
+   * is NEVER serialised to the client; here it is persisted server-side in the
+   * event `context` JSONB, linked by the row id. The client only ever receives
+   * decision + rationale on the IntegrityVerdict — not this private detail.
+   *
+   * Throws on DB error so verdict()'s recordAudit can catch it and degrade to a
+   * local uuid (audit_id is never dropped).
+   */
+  private async persistVerdictAudit(entry: VerdictAuditEntry): Promise<string> {
+    const { data, error } = await this.db.rpc("log_memory_event", {
+      p_memory_id: null,
+      p_event_type: "verdict",
+      p_source: `verdict:${entry.op}`,
+      p_context: {
+        decision: entry.decision,
+        rationale: entry.rationale,
+        seat_id: entry.seat_id,
+        trust_class: entry.trust_class,
+        risk_level: entry.risk_level,
+        degraded: entry.degraded,
+        // Private moat detail — server-side only, never returned to the client.
+        detail: entry.detail ?? {},
+      },
+      p_trace_id: null,
+      p_created_by: null,
+    });
+    if (error) throw new Error(`persistVerdictAudit failed: ${fmtErr(error)}`);
+    return data as string;
   }
 
   /**

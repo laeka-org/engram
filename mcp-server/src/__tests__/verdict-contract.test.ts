@@ -304,6 +304,85 @@ test("block: a blocked verdict still carries all mandatory fields", async () => 
   }
 });
 
+// ---------------------------------------------------------------------------
+// STEP 3 — audit_id resolvable to a memory_events row (§11.2 full).
+// ---------------------------------------------------------------------------
+
+test("§11.2 audit: verdict passes the full private entry to the audit sink", async () => {
+  const captures: Record<string, unknown>[] = [];
+  const v = await verdict(
+    { op: "forget", payload: "mem-9" },
+    { trustClass: "untrusted", seatId: "tenant-z", riskLevel: "destructive" },
+    {
+      persistAudit: async (entry) => {
+        captures.push(entry as unknown as Record<string, unknown>);
+        return "ev-row-777";
+      },
+    },
+  );
+  assert.equal(v.audit_id, "ev-row-777");
+  assert.equal(captures.length, 1, "audit sink must receive exactly one entry");
+  const captured = captures[0];
+  // The audit entry carries the moat detail (decision/rationale/seat/trust);
+  // the CLIENT verdict only carries decision + rationale + audit_id — the
+  // detail stays server-side.
+  assert.equal(captured.op, "forget");
+  assert.equal(captured.decision, "block"); // untrusted destructive → block
+  assert.equal(captured.seat_id, "tenant-z");
+  assert.equal(captured.trust_class, "untrusted");
+  // The verdict serialised to the client must NOT leak the private detail.
+  assert.ok(!("detail" in v), "verdict must not serialise the moat detail");
+  assert.ok(!("seat_id" in v), "verdict must not serialise seat_id");
+});
+
+test("§11.2 audit: a blocked verdict is audited too (every verdict produces a row)", async () => {
+  const ids: string[] = [];
+  await verdict({ op: "store", payload: "x" }, {}, { persistAudit: async () => { ids.push("a"); return "a"; } });
+  await verdict({ op: "forget" }, { trustClass: "external", riskLevel: "destructive" }, { persistAudit: async () => { ids.push("b"); return "b"; } });
+  assert.deepEqual(ids, ["a", "b"], "both allow and block must hit the audit sink");
+});
+
+// Migration 086 — verdict event_type. Additive + non-destructive (the new CHECK
+// list must be a strict superset of migration 062's, plus 'verdict').
+const MIGRATIONS_DIR = join(SRC_DIR, "..", "..", "supabase", "migrations");
+
+function readMigration(name: string): string {
+  return readFileSync(join(MIGRATIONS_DIR, name), "utf8");
+}
+
+function eventTypesInCheck(sql: string): Set<string> {
+  // Grab the event_type IN (...) list and pull every single-quoted literal.
+  const m = /event_type\s+IN\s*\(([\s\S]*?)\)\s*\)/.exec(sql);
+  if (!m) return new Set();
+  const body = m[1];
+  const lits = body.match(/'([^']+)'/g) ?? [];
+  return new Set(lits.map((l) => l.replace(/'/g, "")));
+}
+
+test("migration 086: adds 'verdict' to the memory_events event_type CHECK", () => {
+  const sql = readMigration("086_verdict_event_type.sql");
+  const types = eventTypesInCheck(sql);
+  assert.ok(types.has("verdict"), "086 must allow event_type='verdict'");
+});
+
+test("migration 086: is additive — superset of migration 062's event types", () => {
+  const types062 = eventTypesInCheck(readMigration("062_compute_affect.sql"));
+  const types086 = eventTypesInCheck(readMigration("086_verdict_event_type.sql"));
+  assert.ok(types062.size > 0, "sanity: 062 has a non-empty CHECK list");
+  for (const t of types062) {
+    assert.ok(
+      types086.has(t),
+      `086 must preserve event_type '${t}' from 062 (additive, non-destructive)`,
+    );
+  }
+});
+
+test("migration 086: uses the proven DROP-IF-EXISTS / ADD ALTER pattern", () => {
+  const sql = readMigration("086_verdict_event_type.sql");
+  assert.match(sql, /DROP CONSTRAINT IF EXISTS memory_events_event_type_check/);
+  assert.match(sql, /ADD CONSTRAINT memory_events_event_type_check CHECK/);
+});
+
 // §11.3 reconcile-never-destroys  — PENDING STEP 4
 // §11.4 escalate-never-drops      — PENDING STEP 4/6
 // §11.5 fail-closed-destructive   — PENDING STEP 8
