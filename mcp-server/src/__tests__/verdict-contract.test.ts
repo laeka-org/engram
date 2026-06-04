@@ -24,6 +24,7 @@ import {
   verdict,
   isDestructive,
   evaluateBlockRules,
+  detectReconcile,
   DEFAULT_BLOCK_RULES,
   VERDICT_CONTRACT_VERSION,
 } from "../services/verdict.js";
@@ -32,6 +33,7 @@ import type {
   VerdictContext,
   IntegrityVerdict,
   BlockRule,
+  ReconcileCandidate,
 } from "../services/verdict.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -383,8 +385,126 @@ test("migration 086: uses the proven DROP-IF-EXISTS / ADD ALTER pattern", () => 
   assert.match(sql, /ADD CONSTRAINT memory_events_event_type_check CHECK/);
 });
 
-// §11.3 reconcile-never-destroys  — PENDING STEP 4
-// §11.4 escalate-never-drops      — PENDING STEP 4/6
+// ---------------------------------------------------------------------------
+// STEP 4 — reconcile (the only first-class-NEW decision) + §11.3.
+// ---------------------------------------------------------------------------
+
+// Two embeddings that are near-identical (high cosine) and one that is
+// orthogonal — built by hand so the pure detector is deterministic.
+const VEC_A = [1, 0, 0, 0];
+const VEC_A_NEAR = [0.98, 0.02, 0, 0]; // cosine with VEC_A ≈ 0.9998 (> 0.85)
+const VEC_ORTHO = [0, 1, 0, 0];        // cosine with VEC_A = 0
+
+test("detectReconcile: same-topic + polarity inversion → finding", () => {
+  const candidates: ReconcileCandidate[] = [
+    { id: "old-1", content: "The server is reachable", embedding: VEC_A },
+  ];
+  const findings = detectReconcile("The server is not reachable", VEC_A_NEAR, candidates);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].prior_id, "old-1");
+  assert.ok(findings[0].cosine > 0.85);
+});
+
+test("detectReconcile: same polarity (corroboration) → NO finding", () => {
+  const candidates: ReconcileCandidate[] = [
+    { id: "old-2", content: "The server is reachable", embedding: VEC_A },
+  ];
+  // Same affirmative polarity → corroboration, not contradiction.
+  const findings = detectReconcile("The server is reachable now", VEC_A_NEAR, candidates);
+  assert.equal(findings.length, 0);
+});
+
+test("detectReconcile: different topic (low cosine) → NO finding even if inverted", () => {
+  const candidates: ReconcileCandidate[] = [
+    { id: "old-3", content: "The cat is on the mat", embedding: VEC_ORTHO },
+  ];
+  const findings = detectReconcile("The server is not reachable", VEC_A, candidates);
+  assert.equal(findings.length, 0);
+});
+
+test("detectReconcile: no embedding → empty (cannot judge topic)", () => {
+  const candidates: ReconcileCandidate[] = [
+    { id: "old-4", content: "x is not y", embedding: VEC_A },
+  ];
+  assert.deepEqual(detectReconcile("x is y", undefined, candidates), []);
+});
+
+test("reconcile: verdict returns decision=reconcile with supersedes + validity", async () => {
+  const v = await verdict(
+    { op: "store", payload: "The deploy is not green", embedding: VEC_A_NEAR },
+    {},
+    {
+      reconcileCandidates: async () => [
+        { id: "prior-9", content: "The deploy is green", embedding: VEC_A },
+      ],
+    },
+  );
+  assert.equal(v.decision, "reconcile");
+  assert.deepEqual(v.supersedes, ["prior-9"]);
+  assert.ok(v.validity?.valid_from, "reconcile carries a validity window (valid_from)");
+  assert.ok(v.audit_id.length > 0);
+});
+
+test("reconcile: no candidates → plain allow (reconcile is opt-in by contradiction)", async () => {
+  const v = await verdict(
+    { op: "store", payload: "A fresh unrelated fact", embedding: VEC_A },
+    {},
+    { reconcileCandidates: async () => [] },
+  );
+  assert.equal(v.decision, "allow");
+  assert.equal(v.supersedes, undefined);
+});
+
+test("reconcile: candidate-fetch failure falls through to allow (write not blocked)", async () => {
+  const v = await verdict(
+    { op: "store", payload: "fact", embedding: VEC_A },
+    {},
+    {
+      reconcileCandidates: async () => {
+        throw new Error("neighbour fetch down");
+      },
+    },
+  );
+  assert.equal(v.decision, "allow");
+});
+
+test("reconcile: only store ops reconcile (recall/correct/forget never do)", async () => {
+  for (const op of ["recall", "correct", "forget"] as const) {
+    const v = await verdict(
+      { op, payload: "x", embedding: VEC_A_NEAR },
+      { trustClass: "seat" }, // seat so forget isn't blocked
+      {
+        reconcileCandidates: async () => [
+          { id: "p", content: "x is not y", embedding: VEC_A },
+        ],
+      },
+    );
+    assert.notEqual(v.decision, "reconcile", `op=${op} must not reconcile`);
+  }
+});
+
+// §11.3 reconcile-never-destroys — the supersede_memory RPC (migration 048) is
+// the application mechanism. The bitemporal guarantee is that it NEVER deletes
+// the old row (it sets valid_until + archives), so an asOf read before
+// valid_until still finds it. Pin that at the SQL-contract level.
+test("§11.3 reconcile-never-destroys: supersede_memory archives + bounds, never DELETEs", () => {
+  const sql = readMigration("048_bitemporal_coactivation.sql");
+  // Extract the supersede_memory function body.
+  const fnStart = sql.indexOf("CREATE OR REPLACE FUNCTION supersede_memory");
+  assert.ok(fnStart >= 0, "supersede_memory must exist in migration 048");
+  // Body up to the GRANT line that follows it.
+  const grantIdx = sql.indexOf("GRANT EXECUTE ON FUNCTION supersede_memory", fnStart);
+  const body = sql.slice(fnStart, grantIdx >= 0 ? grantIdx : sql.length);
+  // It must set valid_until and archive — and must NOT issue a DELETE on memories.
+  assert.match(body, /valid_until\s*=\s*NOW\(\)/i, "supersede must bound valid_until");
+  assert.match(body, /stage\s*=\s*'archived'/i, "supersede must archive, not delete");
+  assert.ok(
+    !/DELETE\s+FROM\s+memories/i.test(body),
+    "supersede_memory must NEVER DELETE FROM memories (§11.3 bitemporal)",
+  );
+});
+
+// §11.4 escalate-never-drops      — PENDING STEP 6
 // §11.5 fail-closed-destructive   — PENDING STEP 8
 // §11.6 manifest-only-Sid-surface — PENDING STEP 7
 // §11.7 contract-identical-A/B    — PENDING Profil B (post-dogfood)

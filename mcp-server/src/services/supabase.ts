@@ -264,14 +264,18 @@ export class MemoryService {
   private async gate(
     action: VerdictAction,
     context: VerdictContext = {},
+    extraDeps?: Partial<VerdictDeps>,
   ): Promise<IntegrityVerdict> {
-    const v = await verdict(action, context, this.verdictDeps);
+    const deps = extraDeps ? { ...this.verdictDeps, ...extraDeps } : this.verdictDeps;
+    const v = await verdict(action, context, deps);
     if (v.decision === "block" || v.decision === "escalate") {
       throw new VerdictBlockedError(v);
     }
     if (v.decision === "inject") {
       throw new VerdictBlockedError(v);
     }
+    // allow + reconcile both return: the op proceeds. reconcile additionally
+    // carries .supersedes, which the caller applies post-insert.
     return v;
   }
 
@@ -329,8 +333,20 @@ export class MemoryService {
     opts?: { force_new?: boolean },
     context?: VerdictContext,
   ): Promise<CreateMemoryResult> {
-    // store op — mandatory verdict pre-step (contract §11.1). STEP 1: allow.
-    await this.gate({ op: "store", payload: input.content }, context);
+    // Embed once, up-front: the verdict reconcile path (STEP 4) needs the
+    // incoming vector to run local cosine + polarity detection, and the insert
+    // below reuses the same vector (no double-embed).
+    const embedding = await this.embeddings.embed(input.content);
+
+    // store op — mandatory verdict pre-step (contract §11.1). The reconcile
+    // candidate fetcher is supplied per-call so verdict() can detect a
+    // polarity-inverted contradiction against existing memories and decide
+    // `reconcile` (proceed AND supersede the contradicted prior, never delete).
+    const storeVerdict = await this.gate(
+      { op: "store", payload: input.content, embedding },
+      context,
+      { reconcileCandidates: () => this.reconcileCandidatesFor(input.content, embedding) },
+    );
 
     if (!opts?.force_new) {
       const duplicates = await this.findSimilar(input.content);
@@ -354,8 +370,6 @@ export class MemoryService {
         }
       }
     }
-
-    const embedding = await this.embeddings.embed(input.content);
 
     // Auto-score from text when caller didn't supply explicit values.
     // This is the difference between defaults-everywhere (cognitive model
@@ -387,6 +401,26 @@ export class MemoryService {
 
     if (error) throw new Error(`Failed to create memory: ${fmtErr(error)}`);
     const memory = data as Memory;
+
+    // STEP 4 — reconcile application. The verdict already decided this store
+    // supersedes one or more contradicted priors; now that the new row exists
+    // (we need its id), call supersede_memory (migration 048) per prior. That
+    // RPC sets the old row's valid_until=NOW() + invalidated_by + archives it —
+    // it is NEVER deleted, so an `asOf` read before valid_until still finds it
+    // (§11.3 reconcile-never-destroys). Best-effort: a supersede failure must
+    // not roll back the legitimate new write; it is logged for REM audit.
+    if (storeVerdict.decision === "reconcile" && storeVerdict.supersedes?.length) {
+      for (const oldId of storeVerdict.supersedes) {
+        try {
+          await this.supersede(oldId, memory.id, storeVerdict.rationale);
+        } catch (err) {
+          console.error(
+            `[verdict] supersede ${oldId.slice(0, 8)} → ${memory.id.slice(0, 8)} failed (non-fatal):`,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      }
+    }
 
     // Hebbian seeding: link new memory to its semantic neighbors so spreading
     // activation has something to follow on the very first recall.
@@ -505,6 +539,62 @@ export class MemoryService {
 
     if (error) throw new Error(`Failed to search memories: ${fmtErr(error)}`);
     return (data ?? []) as MemorySearchResult[];
+  }
+
+  /**
+   * Fetch reconcile candidates for an incoming store: the top semantic
+   * neighbours of `content`, with their embeddings, so verdict()'s reconcile
+   * detector can run local cosine + polarity inversion against them. Two-step
+   * (neighbour IDs via cognitive match, then embeddings by id) because the
+   * match RPC does not return embedding vectors. Best-effort: returns [] on
+   * any error so a candidate-fetch hiccup never blocks the write.
+   */
+  private async reconcileCandidatesFor(
+    content: string,
+    embedding: number[],
+  ): Promise<Array<{ id: string; content: string; embedding: number[] }>> {
+    try {
+      const neighbors = await this._search(content, undefined, 5, 1.0);
+      const ids = neighbors.map((n) => n.id);
+      if (ids.length === 0) return [];
+      const { data, error } = await this.db
+        .from("memories")
+        .select("id,content,embedding")
+        .in("id", ids);
+      if (error) {
+        console.error("reconcileCandidatesFor: embedding fetch failed:", fmtErr(error));
+        return [];
+      }
+      const rows = (data ?? []) as Array<{ id: string; content: string; embedding: number[] | null }>;
+      return rows
+        .filter((r) => Array.isArray(r.embedding) && r.embedding.length > 0)
+        .map((r) => ({ id: r.id, content: r.content, embedding: r.embedding as number[] }));
+    } catch (err) {
+      console.error("reconcileCandidatesFor failed (non-fatal):", err instanceof Error ? err.message : String(err));
+      return [];
+    }
+  }
+
+  /**
+   * Apply a reconcile: supersede an old memory with a new one via the live
+   * supersede_memory RPC (migration 048). Sets the old row's valid_until=NOW(),
+   * invalidated_by=new, stage='archived', writes a 'supersedes' relation + a
+   * 'superseded' event. The old row is NEVER deleted, so a bitemporal `asOf`
+   * read before its valid_until still returns it (§11.3). Throws on RPC error
+   * so the caller can log + continue (best-effort, never rolls back the write).
+   */
+  async supersede(oldId: string, newId: string, reason: string): Promise<void> {
+    const { data, error } = await this.db.rpc("supersede_memory", {
+      p_old_id: oldId,
+      p_new_id: newId,
+      p_reason: reason,
+      p_agent_id: null,
+    });
+    if (error) throw new Error(`supersede_memory failed: ${fmtErr(error)}`);
+    const res = data as { ok?: boolean; error?: string } | null;
+    if (res && res.ok === false) {
+      throw new Error(`supersede_memory rejected: ${res.error ?? "unknown"}`);
+    }
   }
 
   /** Rehearse memories — strengthens trace and updates last_accessed_at. */

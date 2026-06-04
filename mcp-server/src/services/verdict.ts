@@ -38,6 +38,12 @@ import type {
   RiskLevel,
 } from "./wire-types.js";
 import { VERDICT_CONTRACT_VERSION } from "./wire-types.js";
+import {
+  cosineSimilarity,
+  classifyPolarity,
+  polarityInverted,
+  COSINE_TOPIC_THRESHOLD,
+} from "./lesson-contradiction-gate.js";
 
 /**
  * The Monade core — the living judgement that verdict() escalates to when the
@@ -90,6 +96,72 @@ export interface VerdictDeps {
    * ("ajuster avant ajouter").
    */
   blockRules?: BlockRule[];
+  /**
+   * Reconcile candidate fetcher (STEP 4). For a `store` action, returns the
+   * existing memories semantically near the incoming payload, so verdict() can
+   * detect a polarity-inverted contradiction and decide `reconcile`. Injected
+   * (MemoryService supplies it from its own neighbour search) so verdict()
+   * never owns a DB client. Absent ⇒ reconcile detection is skipped (allow).
+   *
+   * The fast-path orientation (Sid 2026-06-04) holds: this is a LOCAL cosine +
+   * polarity check (no LLM), reusing lesson-contradiction-gate's heuristics.
+   */
+  reconcileCandidates?: (
+    action: VerdictAction,
+  ) => Promise<ReconcileCandidate[]>;
+}
+
+/** A memory row offered as a reconcile candidate (the minimal shape needed). */
+export interface ReconcileCandidate {
+  id: string;
+  content: string;
+  embedding: number[];
+}
+
+/**
+ * A detected memory-level contradiction — the new fact polarity-inverts an
+ * existing one on the same topic. This is the reconcile signal: the incoming
+ * store should proceed AND supersede the contradicted prior (never delete it).
+ */
+export interface ReconcileFinding {
+  prior_id: string;
+  cosine: number;
+  rationale: string;
+}
+
+/**
+ * Detect reconcile-worthy contradictions between an incoming fact and existing
+ * memories. Pure: reuses cosineSimilarity + classifyPolarity + polarityInverted
+ * from lesson-contradiction-gate (generalised lesson→memory, "ajuster avant
+ * ajouter"). Returns one finding per contradicted prior, strongest cosine first.
+ *
+ * Threshold is COSINE_TOPIC_THRESHOLD (§10.3, 0.85) — same bar the swarm gate
+ * uses, so "same topic + inverted polarity = contradiction" is one definition
+ * across the codebase.
+ */
+export function detectReconcile(
+  incomingContent: string,
+  incomingEmbedding: number[] | undefined,
+  candidates: ReconcileCandidate[],
+): ReconcileFinding[] {
+  if (!incomingEmbedding || incomingEmbedding.length === 0) return [];
+  const incomingPolarity = classifyPolarity(incomingContent);
+  const findings: ReconcileFinding[] = [];
+  for (const c of candidates) {
+    if (!c.embedding || c.embedding.length === 0) continue;
+    const cos = cosineSimilarity(incomingEmbedding, c.embedding);
+    if (!(cos > COSINE_TOPIC_THRESHOLD)) continue;
+    const priorPolarity = classifyPolarity(c.content);
+    if (!polarityInverted(incomingPolarity, priorPolarity)) continue;
+    findings.push({
+      prior_id: c.id,
+      cosine: cos,
+      rationale:
+        `reconcile: incoming fact polarity-inverts memory ${c.id.slice(0, 8)} ` +
+        `at cosine=${cos.toFixed(3)} (${incomingPolarity} vs ${priorPolarity})`,
+    });
+  }
+  return findings.sort((a, b) => b.cosine - a.cosine);
 }
 
 /**
@@ -279,8 +351,48 @@ export async function verdict(
     return makeVerdict("block", blocked.rationale, audit_id);
   }
 
-  // No rule fired → allow. (reconcile / inject / escalate decision layers land
-  // in later steps between block and this allow tail.)
+  // STEP 4 — reconcile layer (store only). Local cosine + polarity inversion
+  // (reuses lesson-contradiction-gate, no LLM). When the incoming fact
+  // polarity-inverts an existing memory on the same topic, the op proceeds AND
+  // supersedes the contradicted prior (valid_to set, never deleted — §11.3).
+  if (action.op === "store" && deps.reconcileCandidates) {
+    let candidates: ReconcileCandidate[] = [];
+    try {
+      candidates = await deps.reconcileCandidates(action);
+    } catch (err) {
+      // Non-fatal: a candidate-fetch failure must not block a legitimate store.
+      // We fall through to allow and log — reconcile is an enhancement, not a
+      // correctness gate for the write itself.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[verdict] reconcileCandidates failed (falling through to allow): ${msg}`);
+    }
+    const content = typeof action.payload === "string" ? action.payload : "";
+    const findings = detectReconcile(content, action.embedding, candidates);
+    if (findings.length > 0) {
+      const supersedes = findings.map((f) => f.prior_id);
+      const rationale =
+        `reconcile (contract v${VERDICT_CONTRACT_VERSION}): store proceeds and ` +
+        `supersedes ${supersedes.length} contradicted memor${supersedes.length === 1 ? "y" : "ies"}; ` +
+        findings[0].rationale;
+      const audit_id = await recordAudit(deps, {
+        op: action.op,
+        decision: "reconcile",
+        rationale,
+        seat_id: seatId,
+        trust_class: trustClass,
+        risk_level: riskLevel,
+        degraded: false,
+        detail: { findings },
+      });
+      return makeVerdict("reconcile", rationale, audit_id, {
+        supersedes,
+        validity: { valid_from: new Date().toISOString() },
+      });
+    }
+  }
+
+  // No rule fired → allow. (inject / escalate decision layers land in later
+  // steps between reconcile and this allow tail.)
   const decision: VerdictDecision = "allow";
   const rationale = `allow (contract v${VERDICT_CONTRACT_VERSION}): op=${action.op} passed all active block rules`;
 
