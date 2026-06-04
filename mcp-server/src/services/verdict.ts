@@ -293,6 +293,17 @@ export function isDestructive(action: VerdictAction, context: VerdictContext): b
 }
 
 /**
+ * Local escalate trigger (contract §4). A destructive op flagged `riskLevel:
+ * "high"` that the block layer let through (trusted seat) is too consequential
+ * to silently allow — it is handed up for living judgement. Deliberately narrow
+ * so the fast path is untouched on normal traffic (orientation Sid). The
+ * manifest (STEP 7) can widen the escalate surface; this is the §4 floor.
+ */
+export function shouldEscalate(action: VerdictAction, context: VerdictContext): boolean {
+  return isDestructive(action, context) && context.riskLevel === "high";
+}
+
+/**
  * Build a fully-formed IntegrityVerdict. Centralised so contract_version and
  * the mandatory-field invariant are stamped in exactly one place — every code
  * path that returns a verdict goes through here, so a verdict can never ship
@@ -427,8 +438,62 @@ export async function verdict(
     }
   }
 
-  // No rule fired → allow. (inject / escalate decision layers land in later
-  // steps between reconcile and this allow tail.)
+  // STEP 6 — escalate layer (contract §4: "le contrat ne peut trancher dans la
+  // politique → remonte à Sid/orchestrateur ; JAMAIS de drop silencieux").
+  //
+  // Local trigger (bounded, falsifiable): a HIGH-risk destructive op that the
+  // block layer let through (trusted seat) is too consequential to silently
+  // allow — it deserves a living judgement. This is the ONLY place the Monade
+  // LLM is consulted (orientation Sid: LLM only on escalate/conflit), so the
+  // 4146 ops/s fast path is never touched on normal traffic.
+  //   - Monade judge present → consult it; honor its decision (allow/block/
+  //     inject/escalate). The judge's lens trace stays private (moat); only
+  //     decision + rationale come back.
+  //   - No judge → decision=escalate: the op HALTS and is handed up. The audit
+  //     row is the hand-up record — zero silent drop (§11.4).
+  if (shouldEscalate(action, context)) {
+    if (deps.monade?.judge) {
+      let judged: { decision: VerdictDecision; rationale: string } | null = null;
+      try {
+        judged = await deps.monade.judge(action, context);
+      } catch (err) {
+        // A judge failure must NOT silently drop the op. Fall through to a
+        // local escalate (hand-up) rather than a silent allow.
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[verdict] monade.judge failed (escalating locally): ${msg}`);
+      }
+      if (judged) {
+        const audit_id = await recordAudit(deps, {
+          op: action.op,
+          decision: judged.decision,
+          rationale: judged.rationale,
+          seat_id: seatId,
+          trust_class: trustClass,
+          risk_level: riskLevel,
+          degraded: false,
+          detail: { source: "monade.judge" },
+        });
+        return makeVerdict(judged.decision, judged.rationale, audit_id);
+      }
+    }
+    const rationale =
+      `escalate (contract v${VERDICT_CONTRACT_VERSION}): high-risk destructive op=${action.op} ` +
+      `cannot be resolved by the fast path — handed up to seat/Sid, op halted (zero silent drop)`;
+    const audit_id = await recordAudit(deps, {
+      op: action.op,
+      decision: "escalate",
+      rationale,
+      seat_id: seatId,
+      trust_class: trustClass,
+      risk_level: riskLevel,
+      degraded: false,
+      detail: { reason: "high_risk_destructive_unresolvable" },
+    });
+    return makeVerdict("escalate", rationale, audit_id);
+  }
+
+  // No rule fired → allow. (inject decision layer lands in a later step between
+  // escalate and this allow tail.)
   const decision: VerdictDecision = "allow";
   const rationale = `allow (contract v${VERDICT_CONTRACT_VERSION}): op=${action.op} passed all active block rules`;
 

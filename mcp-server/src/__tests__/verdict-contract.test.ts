@@ -23,6 +23,7 @@ import { dirname, join } from "node:path";
 import {
   verdict,
   isDestructive,
+  shouldEscalate,
   evaluateBlockRules,
   detectReconcile,
   DEFAULT_BLOCK_RULES,
@@ -580,7 +581,75 @@ test("fail-soft: core down does NOT mask the block-authority rule for destructiv
 
 void coreUp; // referenced for symmetry / future use
 
-// §11.4 escalate-never-drops      — PENDING STEP 6
+// ---------------------------------------------------------------------------
+// STEP 6 — escalate (non-resolvable hand-up) + §11.4 escalate-never-drops.
+// ---------------------------------------------------------------------------
+
+test("shouldEscalate: high-risk destructive → true; lower risk → false", () => {
+  assert.equal(shouldEscalate({ op: "forget" }, { riskLevel: "high" }), true);
+  assert.equal(shouldEscalate({ op: "store" }, { riskLevel: "high" }), false); // not destructive
+  assert.equal(shouldEscalate({ op: "forget" }, { riskLevel: "destructive" }), false); // not "high"
+  assert.equal(shouldEscalate({ op: "forget" }, {}), false);
+});
+
+test("§11.4 escalate: high-risk destructive op with no judge → decision=escalate (op halts, never drops)", async () => {
+  const captures: Record<string, unknown>[] = [];
+  const v = await verdict(
+    { op: "forget", payload: "m" },
+    { trustClass: "seat", riskLevel: "high" },
+    { persistAudit: async (e) => { captures.push(e as unknown as Record<string, unknown>); return "esc-1"; } },
+  );
+  assert.equal(v.decision, "escalate");
+  assert.equal(v.audit_id, "esc-1", "escalate is audited — the hand-up record (zero silent drop)");
+  assert.equal(captures.length, 1, "exactly one audit row = the hand-up");
+  assert.match(v.rationale, /handed up|zero silent drop/);
+});
+
+test("escalate: Monade judge present → its decision is honored (LLM only on escalate)", async () => {
+  let judgeCalls = 0;
+  const v = await verdict(
+    { op: "forget", payload: "m" },
+    { trustClass: "seat", riskLevel: "high" },
+    {
+      monade: {
+        health: async () => true,
+        judge: async () => { judgeCalls++; return { decision: "block", rationale: "judge: refuse" }; },
+      },
+    },
+  );
+  assert.equal(v.decision, "block");
+  assert.match(v.rationale, /judge/);
+  assert.equal(judgeCalls, 1, "judge consulted exactly once on escalate");
+});
+
+test("escalate: a FAILING judge does not silently drop — falls through to local escalate", async () => {
+  const v = await verdict(
+    { op: "forget", payload: "m" },
+    { trustClass: "seat", riskLevel: "high" },
+    { monade: { health: async () => true, judge: async () => { throw new Error("judge down"); } } },
+  );
+  assert.equal(v.decision, "escalate", "judge failure → escalate, never silent allow/drop");
+});
+
+test("escalate: normal traffic does NOT consult the judge (fast path untouched)", async () => {
+  let judgeCalls = 0;
+  const monade = {
+    health: async () => true,
+    judge: async () => { judgeCalls++; return { decision: "allow" as const, rationale: "n/a" }; },
+  };
+  // A plain store / recall / non-high forget must never reach the judge.
+  await verdict({ op: "store", payload: "x" }, {}, { monade });
+  await verdict({ op: "recall", payload: "q" }, {}, { monade });
+  await verdict({ op: "forget" }, { trustClass: "seat" }, { monade }); // not high-risk
+  assert.equal(judgeCalls, 0, "judge must NOT be consulted on normal fast-path traffic");
+});
+
+test("§11.4 escalate: every escalate carries a resolvable audit_id (the hand-up trace)", async () => {
+  const v = await verdict({ op: "forget" }, { trustClass: "seat", riskLevel: "high" });
+  assert.equal(v.decision, "escalate");
+  assert.ok(v.audit_id.length > 0, "escalate must carry an audit_id (no silent drop)");
+});
+
 // §11.6 manifest-only-Sid-surface — PENDING STEP 7
 // §11.7 contract-identical-A/B    — PENDING Profil B (post-dogfood)
 
