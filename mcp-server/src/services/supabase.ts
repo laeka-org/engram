@@ -10,6 +10,13 @@ import type {
 } from "../types/memory.js";
 import type { EmbeddingProvider } from "./embeddings.js";
 import { scoreEncoding } from "./heuristics.js";
+import { verdict } from "./verdict.js";
+import type {
+  VerdictAction,
+  VerdictContext,
+  IntegrityVerdict,
+  VerdictDeps,
+} from "./verdict.js";
 
 /**
  * PostgREST sometimes returns errors without a `.message` field (e.g. PGRST202,
@@ -143,12 +150,41 @@ export function buildRecalledContext(
   return { hits, score: topScore, query_length: queryLength };
 }
 
+/**
+ * Thrown when the verdict gate refuses an operation (block / inject /
+ * escalate). Carries the full IntegrityVerdict so the tool layer can surface
+ * rationale + audit_id + any correction to the caller. A plain Error subclass
+ * so existing `catch` sites keep working; callers that want the structured
+ * verdict check `err instanceof VerdictBlockedError`.
+ */
+export class VerdictBlockedError extends Error {
+  readonly verdict: IntegrityVerdict;
+  constructor(verdict: IntegrityVerdict) {
+    super(`memory op ${verdict.decision}: ${verdict.rationale} [audit_id=${verdict.audit_id}]`);
+    this.name = "VerdictBlockedError";
+    this.verdict = verdict;
+  }
+}
+
 export class MemoryService {
   private db: PostgrestClient;
   private embeddings: EmbeddingProvider;
   private healthy = true;
+  /**
+   * Verdict-contract side effects (audit sink + Monade core). Injected so the
+   * decision logic stays testable and so this class remains the single owner
+   * of the DB client. Empty by default = STEP 1 transparent skeleton (verdict
+   * returns allow, audit_id is a local uuid). Later steps inject the audit sink
+   * and the Monade health/judge core.
+   */
+  private verdictDeps: VerdictDeps;
 
-  constructor(supabaseUrl: string, supabaseKey: string, embeddings: EmbeddingProvider) {
+  constructor(
+    supabaseUrl: string,
+    supabaseKey: string,
+    embeddings: EmbeddingProvider,
+    verdictDeps: VerdictDeps = {},
+  ) {
     // Use PostgrestClient directly instead of supabase-js: self-hosted PostgREST
     // serves under "/" while supabase-js hard-codes the "/rest/v1" prefix from
     // Supabase Cloud, which would 404 against our docker setup.
@@ -158,6 +194,41 @@ export class MemoryService {
         : {},
     });
     this.embeddings = embeddings;
+    this.verdictDeps = verdictDeps;
+  }
+
+  /**
+   * The mandatory verdict pre-step (soudure plan §1, contract §11.1).
+   *
+   * Every public memory operation calls this as its FIRST instruction. It runs
+   * verdict(action, context) and enforces the decision:
+   *   - allow      → returns the verdict, op proceeds unchanged.
+   *   - block      → throws VerdictBlockedError (op refused).
+   *   - inject     → throws VerdictBlockedError carrying the correction.
+   *   - reconcile  → returns the verdict; the op reads .supersedes to apply it.
+   *   - escalate   → throws VerdictBlockedError (op halted, handed up).
+   *
+   * STEP 1: verdict() only ever returns allow, so this is transparent. The
+   * branching above is the seam the later steps fill — but it is wired NOW so
+   * that adding a non-allow decision later requires zero new call sites
+   * (non-contournability is established by construction, not retrofitted).
+   *
+   * Centralising the enforcement here (one private method, called first in
+   * every op) is what makes the structural lint test possible: "every public
+   * MemoryService op calls this.gate() before any DB access".
+   */
+  private async gate(
+    action: VerdictAction,
+    context: VerdictContext = {},
+  ): Promise<IntegrityVerdict> {
+    const v = await verdict(action, context, this.verdictDeps);
+    if (v.decision === "block" || v.decision === "escalate") {
+      throw new VerdictBlockedError(v);
+    }
+    if (v.decision === "inject") {
+      throw new VerdictBlockedError(v);
+    }
+    return v;
   }
 
   async healthCheck(): Promise<boolean> {
@@ -174,9 +245,12 @@ export class MemoryService {
     return this.healthy;
   }
 
-  /** Find near-duplicate memories using a pure-vector pass (relevance only). */
+  /** Find near-duplicate memories using a pure-vector pass (relevance only).
+   *  Uses the raw `_search` path: this is a dedup probe internal to the store
+   *  op, not a standalone recall, so it does not re-gate (the enclosing store
+   *  already gated). */
   async findSimilar(content: string, threshold: number = 0.92): Promise<MemorySearchResult[]> {
-    const results = await this.search(content, undefined, 3, 1.0);
+    const results = await this._search(content, undefined, 3, 1.0);
     return results.filter((r) => r.relevance >= threshold);
   }
 
@@ -208,8 +282,12 @@ export class MemoryService {
    *  unique constraint on content hash) outside R3 scope. */
   async createWithDedupInfo(
     input: CreateMemoryInput,
-    opts?: { force_new?: boolean }
+    opts?: { force_new?: boolean },
+    context?: VerdictContext,
   ): Promise<CreateMemoryResult> {
+    // store op — mandatory verdict pre-step (contract §11.1). STEP 1: allow.
+    await this.gate({ op: "store", payload: input.content }, context);
+
     if (!opts?.force_new) {
       const duplicates = await this.findSimilar(input.content);
       if (duplicates.length > 0) {
@@ -269,7 +347,7 @@ export class MemoryService {
     // Hebbian seeding: link new memory to its semantic neighbors so spreading
     // activation has something to follow on the very first recall.
     try {
-      const neighbors = await this.search(input.content, undefined, 4, 1.0);
+      const neighbors = await this._search(input.content, undefined, 4, 1.0);
       const neighborIds = neighbors
         .map((n) => n.id)
         .filter((id) => id !== memory.id)
@@ -341,6 +419,27 @@ export class MemoryService {
    * (the default) recall behaves exactly as before — global, all visible.
    */
   async search(
+    query: string,
+    category?: string,
+    limit: number = 10,
+    vectorWeight: number = 0.6,
+    scope?: { projectId: string | null; includePinnedGlobal?: boolean },
+    context?: VerdictContext,
+  ): Promise<MemorySearchResult[]> {
+    // recall op — mandatory verdict pre-step (contract §11.1). STEP 1: allow.
+    await this.gate({ op: "recall", payload: query }, context);
+    return this._search(query, category, limit, vectorWeight, scope);
+  }
+
+  /**
+   * Raw search with no verdict gate. PRIVATE — used by internal paths that are
+   * already inside a gated op (createWithDedupInfo's dedup probe, auto-link
+   * neighbour lookup, findSimilar). Gating these would double-count the recall
+   * op for a single store and could deadlock a future block rule against its
+   * own write. The public `search` is the only externally-reachable recall and
+   * it always gates.
+   */
+  private async _search(
     query: string,
     category?: string,
     limit: number = 10,
@@ -488,7 +587,10 @@ export class MemoryService {
     return data as Memory;
   }
 
-  async update(input: UpdateMemoryInput): Promise<Memory> {
+  async update(input: UpdateMemoryInput, context?: VerdictContext): Promise<Memory> {
+    // correct op — mandatory verdict pre-step (contract §11.1). STEP 1: allow.
+    await this.gate({ op: "correct", payload: input }, context);
+
     const updates: Record<string, unknown> = {};
     if (input.content !== undefined) {
       updates.content = input.content;
@@ -513,7 +615,15 @@ export class MemoryService {
     return data as Memory;
   }
 
-  async delete(id: string): Promise<boolean> {
+  async delete(id: string, context?: VerdictContext): Promise<boolean> {
+    // forget op (hard delete) — mandatory verdict pre-step (contract §11.1).
+    // Destructive: fail-soft policy (§7) will fail-closed here when the Monade
+    // core is unreachable (wired in a later step). STEP 1: allow.
+    await this.gate(
+      { op: "forget", payload: id },
+      { riskLevel: "destructive", ...context },
+    );
+
     const { error } = await this.db.from("memories").delete().eq("id", id);
     if (error) throw new Error(`Failed to delete memory: ${fmtErr(error)}`);
     return true;
@@ -622,7 +732,14 @@ export class MemoryService {
    * RPCs (which archive rather than hard-delete) so scoped destructive ops
    * are recoverable. Hard delete is available via .delete(id).
    */
-  async archive(id: string): Promise<void> {
+  async archive(id: string, context?: VerdictContext): Promise<void> {
+    // forget op (soft archive) — mandatory verdict pre-step (contract §11.1).
+    // Destructive-soft; subject to the same fail-soft policy as delete. STEP 1: allow.
+    await this.gate(
+      { op: "forget", payload: id },
+      { riskLevel: "destructive", ...context },
+    );
+
     const { error } = await this.db
       .from("memories")
       .update({ stage: "archived" })

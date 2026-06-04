@@ -184,6 +184,98 @@ export function canonicalizeForSigning<
 // validator (Phase 3b) is the one that decides whether to ingest.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Verdict contract v1 (FROZEN) — types only.
+//
+// Source of truth: handoffs/2026-06-04-verdict-contract-v1-frozen-R-output.md
+// §2 (signature), §3 (IntegrityVerdict), §4 (decision enum). The *form* is
+// frozen: signature, decision enum, mandatory fields, governance model. Any
+// change to those = major version bump (contract §10). Optional fields are
+// additive-only and never breaking.
+//
+// These live in wire-types.ts (per the soudure plan §3) because they are the
+// shape contract that the verdict() implementation (services/verdict.ts) and
+// every MemoryService op share — same "shape, not validity" discipline as the
+// swarm wire interfaces above.
+// ---------------------------------------------------------------------------
+
+/** Memory operation under verdict — contract §2.1 (enum frozen v1). */
+export type MemoryOp = "store" | "recall" | "correct" | "forget";
+
+/** Trust class of the calling seat — contract §2.2 (frozen). */
+export type TrustClass = "dyade" | "seat" | "external" | "untrusted";
+
+/** Risk level of the action — contract §2.2 (frozen). */
+export type RiskLevel = "low" | "medium" | "high" | "destructive";
+
+/** Decision enum — contract §4 (frozen v1, exactly five). */
+export type VerdictDecision =
+  | "allow"
+  | "block"
+  | "inject"
+  | "reconcile"
+  | "escalate";
+
+/**
+ * Action under verdict — contract §2.1 (frozen).
+ *
+ * `payload` is op-dependent (a fact for store, a query for recall, a
+ * memory reference for correct/forget). `embedding` is an optional
+ * pre-computed vector so the verdict path can run contradiction detection
+ * without re-embedding when the caller already supplies the vector.
+ */
+export interface VerdictAction {
+  op: MemoryOp;
+  payload?: unknown;
+  embedding?: number[];
+}
+
+/**
+ * Context under verdict — contract §2.2 (frozen).
+ *
+ * `asOf` is the bitemporal read-path parameter ("as it was at time T").
+ * Optional everywhere so internal callers that pre-date the contract still
+ * compile; verdict() applies safe defaults (untrusted / low) for any field
+ * the caller omits, so a thin context can never silently widen authority.
+ */
+export interface VerdictContext {
+  trustClass?: TrustClass;
+  seatId?: string;
+  riskLevel?: RiskLevel;
+  asOf?: string;
+}
+
+/**
+ * IntegrityVerdict — the frozen response shape (contract §3).
+ *
+ * Mandatory v1 fields (never removed): contract_version, decision,
+ * rationale, audit_id. Populated-by-decision (frozen in form): supersedes,
+ * validity. Extensible (additive, never breaking): correction, confidence
+ * (the latter DEFERRED to v1.x).
+ *
+ * The E/S/A lens trace + Monade synthesis are NEVER serialised here — they
+ * feed decision/rationale but live in the private audit linked by audit_id
+ * (contract §3 moat clause).
+ */
+export interface IntegrityVerdict {
+  // --- MANDATORY v1 (frozen, never removed) ---
+  contract_version: string;
+  decision: VerdictDecision;
+  rationale: string;
+  audit_id: string;
+
+  // --- POPULATED by decision (frozen in form) ---
+  supersedes?: string[];
+  validity?: { valid_from: string; valid_to?: string };
+
+  // --- EXTENSIBLE (additive, never breaking) ---
+  correction?: unknown;
+  confidence?: number; // DEFERRED v1.x
+}
+
+/** Contract version stamped on every verdict (contract §10). */
+export const VERDICT_CONTRACT_VERSION = "1.0";
+
 export type WireKind =
   | "lesson"
   | "hub_anchor"
