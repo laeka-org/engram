@@ -82,6 +82,106 @@ export interface VerdictDeps {
   persistAudit?: (entry: VerdictAuditEntry) => Promise<string>;
   /** Liveness + judgement core. Consulted only on escalate (fast-path stays local). */
   monade?: MonadeCore;
+  /**
+   * Policy surface — the block rules verdict() consults on the fast path.
+   * Manifest-fed in STEP 7 (invariants.yaml signed by Sid). When absent,
+   * verdict() uses DEFAULT_BLOCK_RULES (the contract §4 floor). Generalises the
+   * allow/block shape of services/admission-gate.ts from lessons to all ops
+   * ("ajuster avant ajouter").
+   */
+  blockRules?: BlockRule[];
+}
+
+/**
+ * A pure block rule — the generalised form of admission-gate's
+ * AdmissionResult, lifted from lessons-only to any memory op. Returns a
+ * BlockOutcome to deny, or null to abstain (rule does not apply). Pure: no
+ * I/O, trivially testable, exactly the admission-gate discipline.
+ */
+export type BlockRule = (
+  action: VerdictAction,
+  context: VerdictContext,
+) => BlockOutcome | null;
+
+export interface BlockOutcome {
+  /** Machine-readable reason tag (admission-gate convention). */
+  reason: string;
+  /** Human-readable rationale surfaced to the caller. */
+  rationale: string;
+}
+
+/**
+ * Forbidden-content denylist (contract §4: "ne jamais stocker <catégorie de
+ * donnée sensible>"). STEP 2 floor — the manifest (STEP 7) replaces this with
+ * the Sid-signed invariant list. Matches case-insensitively as a defensive
+ * minimum; the real policy is plain-language business rules at the manifest.
+ *
+ * Empty by default for the live skeleton (a too-eager floor would block real
+ * memories); the mechanism is what STEP 2 ships, the content is manifest-fed.
+ */
+export const DEFAULT_FORBIDDEN_PATTERNS: RegExp[] = [];
+
+/**
+ * The contract §4 block floor, generalised from admission-gate:
+ *   1. forbidden-content — a store whose payload matches the denylist.
+ *   2. destructive-without-authority — a forget/destructive op from an
+ *      untrusted seat is refused (the §4 "forget/correct destructif sans
+ *      autorité → refusé" clause). dyade/seat are trusted; external/untrusted
+ *      are not.
+ *
+ * These are conservative and additive: the manifest can widen them, never
+ * silently narrow the destructive-authority floor (that is a re-signature, §6).
+ */
+export const DEFAULT_BLOCK_RULES: BlockRule[] = [
+  function forbiddenContent(action): BlockOutcome | null {
+    if (action.op !== "store") return null;
+    const text = typeof action.payload === "string" ? action.payload : "";
+    for (const pat of DEFAULT_FORBIDDEN_PATTERNS) {
+      pat.lastIndex = 0;
+      if (pat.test(text)) {
+        return {
+          reason: "forbidden_content",
+          rationale: `store refused: payload matches a manifest forbidden-content invariant`,
+        };
+      }
+    }
+    return null;
+  },
+  function destructiveWithoutAuthority(action, context): BlockOutcome | null {
+    if (!isDestructive(action, context)) return null;
+    // Authority semantics (contract §4): a destructive op is refused only when
+    // the caller DECLARES an untrusted/external trust class. An ABSENT
+    // trustClass = an internal MCP-server-side caller (the engram corps acting
+    // on its own store) and is authorised — we never silently downgrade an
+    // internal forget to "untrusted". External callers MUST declare their
+    // trust class (Profil B connector / tenant), and external/untrusted ones
+    // are refused destructive ops.
+    const trust = context.trustClass;
+    if (trust === undefined || trust === "dyade" || trust === "seat") return null;
+    return {
+      reason: "destructive_without_authority",
+      rationale:
+        `${action.op} refused: destructive op requires a trusted seat ` +
+        `(dyade/seat); caller trustClass=${trust}`,
+    };
+  },
+];
+
+/**
+ * Run the block rules in order; first deny wins (admission-gate convention:
+ * "the first failure wins so telemetry counters are unambiguous"). Returns the
+ * BlockOutcome to deny, or null to allow through to the next decision layer.
+ */
+export function evaluateBlockRules(
+  action: VerdictAction,
+  context: VerdictContext,
+  rules: BlockRule[],
+): BlockOutcome | null {
+  for (const rule of rules) {
+    const out = rule(action, context);
+    if (out) return out;
+  }
+  return null;
 }
 
 /**
@@ -161,9 +261,28 @@ export async function verdict(
   const trustClass = context.trustClass ?? "untrusted";
   const riskLevel = context.riskLevel ?? "low";
 
-  // STEP 1 transparent skeleton: no rule fires; every op is allowed.
+  // STEP 2 — block layer (generalised from admission-gate). Fast, pure, local.
+  // First deny wins. Manifest-fed rules (STEP 7) override the §4 floor.
+  const rules = deps.blockRules ?? DEFAULT_BLOCK_RULES;
+  const blocked = evaluateBlockRules(action, context, rules);
+  if (blocked) {
+    const audit_id = await recordAudit(deps, {
+      op: action.op,
+      decision: "block",
+      rationale: blocked.rationale,
+      seat_id: seatId,
+      trust_class: trustClass,
+      risk_level: riskLevel,
+      degraded: false,
+      detail: { reason: blocked.reason },
+    });
+    return makeVerdict("block", blocked.rationale, audit_id);
+  }
+
+  // No rule fired → allow. (reconcile / inject / escalate decision layers land
+  // in later steps between block and this allow tail.)
   const decision: VerdictDecision = "allow";
-  const rationale = `allow (contract v${VERDICT_CONTRACT_VERSION} skeleton): op=${action.op} passed with no active rule`;
+  const rationale = `allow (contract v${VERDICT_CONTRACT_VERSION}): op=${action.op} passed all active block rules`;
 
   const audit_id = await recordAudit(deps, {
     op: action.op,

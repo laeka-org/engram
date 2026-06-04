@@ -23,12 +23,15 @@ import { dirname, join } from "node:path";
 import {
   verdict,
   isDestructive,
+  evaluateBlockRules,
+  DEFAULT_BLOCK_RULES,
   VERDICT_CONTRACT_VERSION,
 } from "../services/verdict.js";
 import type {
   VerdictAction,
   VerdictContext,
   IntegrityVerdict,
+  BlockRule,
 } from "../services/verdict.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -216,6 +219,88 @@ test("§11.2 partial: every verdict carries a non-empty audit_id", async () => {
   for (const op of ALL_OPS) {
     const v: IntegrityVerdict = await verdict({ op });
     assert.ok(v.audit_id && v.audit_id.length > 0, `op=${op} must carry audit_id`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// STEP 2 — block decision (generalised from admission-gate). Covers all ops.
+// ---------------------------------------------------------------------------
+
+test("block: destructive op (forget) from an external seat is refused", async () => {
+  const v = await verdict(
+    { op: "forget", payload: "mem-1" },
+    { trustClass: "external", riskLevel: "destructive", seatId: "tenant-x" },
+  );
+  assert.equal(v.decision, "block");
+  assert.match(v.rationale, /destructive op requires a trusted seat/);
+  assert.ok(v.audit_id.length > 0);
+});
+
+test("block: destructive op from untrusted seat is refused", async () => {
+  const v = await verdict(
+    { op: "forget", payload: "mem-1" },
+    { trustClass: "untrusted" },
+  );
+  assert.equal(v.decision, "block");
+});
+
+test("block: destructive op from dyade/seat is allowed (authority present)", async () => {
+  for (const trust of ["dyade", "seat"] as const) {
+    const v = await verdict({ op: "forget", payload: "mem-1" }, { trustClass: trust });
+    assert.equal(v.decision, "allow", `trustClass=${trust} should be authorised`);
+  }
+});
+
+test("block: ABSENT trustClass on a destructive op = internal caller, allowed (no silent downgrade)", async () => {
+  // The live forget tool calls service.delete(id) context-free. That internal
+  // path must NOT be blocked — only callers that DECLARE external/untrusted are.
+  const v = await verdict({ op: "forget", payload: "mem-1" }, { riskLevel: "destructive" });
+  assert.equal(v.decision, "allow");
+});
+
+test("block: non-destructive ops (store/recall) from external seat still allow by default floor", async () => {
+  // The §4 default floor only blocks destructive-without-authority +
+  // forbidden-content. A plain external recall is allowed (the manifest can
+  // tighten this later; the floor must not over-block).
+  const r = await verdict({ op: "recall", payload: "q" }, { trustClass: "external" });
+  assert.equal(r.decision, "allow");
+  const s = await verdict({ op: "store", payload: "fact" }, { trustClass: "external" });
+  assert.equal(s.decision, "allow");
+});
+
+test("block: custom forbidden-content rule denies a matching store", async () => {
+  const denySecrets: BlockRule = (action) => {
+    if (action.op === "store" && typeof action.payload === "string" && /SSN:/.test(action.payload)) {
+      return { reason: "forbidden_content", rationale: "store refused: contains SSN" };
+    }
+    return null;
+  };
+  const v = await verdict(
+    { op: "store", payload: "SSN: 123-45-6789" },
+    {},
+    { blockRules: [denySecrets] },
+  );
+  assert.equal(v.decision, "block");
+  assert.match(v.rationale, /SSN/);
+});
+
+test("block: first-deny-wins ordering (admission-gate convention)", () => {
+  const ruleA: BlockRule = () => ({ reason: "a", rationale: "rule A denied" });
+  const ruleB: BlockRule = () => ({ reason: "b", rationale: "rule B denied" });
+  const out = evaluateBlockRules({ op: "store" }, {}, [ruleA, ruleB]);
+  assert.equal(out?.reason, "a");
+});
+
+test("block: evaluateBlockRules returns null when no rule fires", () => {
+  const out = evaluateBlockRules({ op: "recall" }, {}, DEFAULT_BLOCK_RULES);
+  assert.equal(out, null);
+});
+
+test("block: a blocked verdict still carries all mandatory fields", async () => {
+  const v = await verdict({ op: "forget" }, { trustClass: "untrusted" });
+  const rec = v as unknown as Record<string, unknown>;
+  for (const k of ["contract_version", "decision", "rationale", "audit_id"] as const) {
+    assert.ok(k in v && rec[k], `mandatory ${k} on block`);
   }
 });
 
