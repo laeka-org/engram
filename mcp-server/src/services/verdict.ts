@@ -109,6 +109,50 @@ export interface VerdictDeps {
   reconcileCandidates?: (
     action: VerdictAction,
   ) => Promise<ReconcileCandidate[]>;
+  /**
+   * Inject rules (STEP 5) — deny-with-content. A rule may return a substitute
+   * `correction` to be returned to the caller INSTEAD of executing the request
+   * (contract §4: recall returns a filtered/re-ranked set; store writes a
+   * sanitised version). Pure, ordered, first-inject-wins — same shape as the
+   * block rules. Manifest-fed later; empty by default (no inject on the floor).
+   */
+  injectRules?: InjectRule[];
+}
+
+/**
+ * A pure inject rule — deny-with-content. Returns an InjectOutcome (the
+ * substitute correction + rationale) to inject, or null to abstain. Pure: no
+ * I/O. The correction payload is the only verdict field beyond the mandatory
+ * four that inject populates (contract §3 `correction?` extensible).
+ */
+export type InjectRule = (
+  action: VerdictAction,
+  context: VerdictContext,
+) => InjectOutcome | null;
+
+export interface InjectOutcome {
+  /** Machine-readable reason tag. */
+  reason: string;
+  /** Human-readable rationale. */
+  rationale: string;
+  /** The substitute payload returned to the caller instead of executing. */
+  correction: unknown;
+}
+
+/**
+ * Run inject rules in order; first inject wins. Returns the InjectOutcome to
+ * deny-with-content, or null to fall through to the next decision layer.
+ */
+export function evaluateInjectRules(
+  action: VerdictAction,
+  context: VerdictContext,
+  rules: InjectRule[],
+): InjectOutcome | null {
+  for (const rule of rules) {
+    const out = rule(action, context);
+    if (out) return out;
+  }
+  return null;
 }
 
 /** A memory row offered as a reconcile candidate (the minimal shape needed). */
@@ -396,6 +440,32 @@ export async function verdict(
       detail: { reason: blocked.reason },
     });
     return makeVerdict("block", blocked.rationale, audit_id);
+  }
+
+  // STEP 5 — inject layer (deny-with-content, §4). Runs after block (block is
+  // the hard refusal; inject is the soft "here is a corrected substitute
+  // instead"). Pure, first-inject-wins. Returns a `correction` payload; the op
+  // is NOT executed. Empty by default — manifest-fed later. The asOf read-path
+  // bitemporal filtering rides on context.asOf, which is carried + audited here
+  // (the SQL-side asOf recall filter is a documented read-path follow-up).
+  const injectRules = deps.injectRules ?? [];
+  if (injectRules.length > 0) {
+    const injected = evaluateInjectRules(action, context, injectRules);
+    if (injected) {
+      const audit_id = await recordAudit(deps, {
+        op: action.op,
+        decision: "inject",
+        rationale: injected.rationale,
+        seat_id: seatId,
+        trust_class: trustClass,
+        risk_level: riskLevel,
+        degraded: false,
+        detail: { reason: injected.reason, asOf: context.asOf ?? null },
+      });
+      return makeVerdict("inject", injected.rationale, audit_id, {
+        correction: injected.correction,
+      });
+    }
   }
 
   // STEP 4 — reconcile layer (store only). Local cosine + polarity inversion

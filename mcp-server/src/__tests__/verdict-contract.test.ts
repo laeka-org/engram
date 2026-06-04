@@ -25,6 +25,7 @@ import {
   isDestructive,
   shouldEscalate,
   evaluateBlockRules,
+  evaluateInjectRules,
   detectReconcile,
   DEFAULT_BLOCK_RULES,
   VERDICT_CONTRACT_VERSION,
@@ -34,6 +35,7 @@ import type {
   VerdictContext,
   IntegrityVerdict,
   BlockRule,
+  InjectRule,
   ReconcileCandidate,
 } from "../services/verdict.js";
 
@@ -648,6 +650,80 @@ test("§11.4 escalate: every escalate carries a resolvable audit_id (the hand-up
   const v = await verdict({ op: "forget" }, { trustClass: "seat", riskLevel: "high" });
   assert.equal(v.decision, "escalate");
   assert.ok(v.audit_id.length > 0, "escalate must carry an audit_id (no silent drop)");
+});
+
+// ---------------------------------------------------------------------------
+// STEP 5 — inject (deny-with-content). Returns a `correction` substitute.
+// ---------------------------------------------------------------------------
+
+const sanitiseRule: InjectRule = (action) => {
+  if (action.op === "store" && typeof action.payload === "string" && /password=/.test(action.payload)) {
+    return {
+      reason: "sanitised_secret",
+      rationale: "store deny-with-content: secret redacted",
+      correction: action.payload.replace(/password=\S+/, "password=[REDACTED]"),
+    };
+  }
+  return null;
+};
+
+test("inject: a matching rule returns decision=inject with a correction payload", async () => {
+  const v = await verdict(
+    { op: "store", payload: "login password=hunter2" },
+    {},
+    { injectRules: [sanitiseRule] },
+  );
+  assert.equal(v.decision, "inject");
+  assert.equal(v.correction, "login password=[REDACTED]");
+  assert.match(v.rationale, /redacted/);
+  assert.ok(v.audit_id.length > 0);
+});
+
+test("inject: non-matching action falls through (allow)", async () => {
+  const v = await verdict(
+    { op: "store", payload: "an ordinary fact" },
+    {},
+    { injectRules: [sanitiseRule] },
+  );
+  assert.equal(v.decision, "allow");
+  assert.equal(v.correction, undefined);
+});
+
+test("inject: empty inject rules → no inject (floor is empty)", async () => {
+  const v = await verdict({ op: "recall", payload: "q" }, {});
+  assert.notEqual(v.decision, "inject");
+});
+
+test("inject: block takes precedence over inject (hard refusal wins)", async () => {
+  // An untrusted destructive op hits block BEFORE the inject layer.
+  const v = await verdict(
+    { op: "forget", payload: "password=x" },
+    { trustClass: "untrusted", riskLevel: "destructive" },
+    { injectRules: [sanitiseRule] },
+  );
+  assert.equal(v.decision, "block");
+});
+
+test("inject: first-inject-wins ordering", () => {
+  const a: InjectRule = () => ({ reason: "a", rationale: "A", correction: "ca" });
+  const b: InjectRule = () => ({ reason: "b", rationale: "B", correction: "cb" });
+  const out = evaluateInjectRules({ op: "store" }, {}, [a, b]);
+  assert.equal(out?.correction, "ca");
+});
+
+test("inject: context.asOf is carried through to the audit (read-path bitemporal field)", async () => {
+  const captures: Record<string, unknown>[] = [];
+  const asOf = "2026-03-01T00:00:00.000Z";
+  await verdict(
+    { op: "recall", payload: "q" },
+    { asOf },
+    {
+      injectRules: [() => ({ reason: "r", rationale: "filtered", correction: [] })],
+      persistAudit: async (e) => { captures.push(e as unknown as Record<string, unknown>); return "id"; },
+    },
+  );
+  const detail = captures[0].detail as Record<string, unknown>;
+  assert.equal(detail.asOf, asOf, "asOf must be carried into the audit detail");
 });
 
 // §11.6 manifest-only-Sid-surface — PENDING STEP 7
