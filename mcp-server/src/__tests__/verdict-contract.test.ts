@@ -798,7 +798,49 @@ test("§11.6: manifestSummary exposes ids + signed flag (introspection, no numbe
   assert.ok(s.invariant_ids.includes("no-destruction-without-authority"));
 });
 
-// §11.7 contract-identical-A/B    — PENDING Profil B (post-dogfood)
+// ---------------------------------------------------------------------------
+// STEP 9 — §11 conformance closure.
+//
+// §11.1..§11.6 are implemented + asserted above. §11.7 (contract identical
+// A/B) is a CROSS-DEPLOYABLE property: it requires Profil B (the connector SKU)
+// to exist, which the plan defers to post-dogfood (§8/§9). We do NOT fake it
+// green. What we CAN assert now is the PREREQUISITE: the contract shape is a
+// single shared export, so when Profil B is built it consumes the same shape
+// by construction (divergence would require a second, separate type — which the
+// single-source export prevents).
+// ---------------------------------------------------------------------------
+
+test("§11.7 prerequisite: the contract shape is a single shared export (one source of truth)", async () => {
+  // The verdict types are re-exported from one module; both profiles import
+  // from here. A type drift between A and B is impossible while this is the
+  // sole definition. (Full A/B parity is asserted when Profil B ships.)
+  const wire = await import("../services/wire-types.js");
+  assert.equal(wire.VERDICT_CONTRACT_VERSION, "1.0", "contract_version is the shared stamp");
+  // verdict.js re-exports the same constant — same single source.
+  const v = await import("../services/verdict.js");
+  assert.equal(v.VERDICT_CONTRACT_VERSION, wire.VERDICT_CONTRACT_VERSION);
+});
+
+test("§11 closure: every produced verdict stamps the frozen contract_version", async () => {
+  // Exercise one verdict per decision branch and confirm the version stamp.
+  const cases: Array<Promise<IntegrityVerdict>> = [
+    verdict({ op: "store", payload: "x" }),                                            // allow
+    verdict({ op: "forget" }, { trustClass: "untrusted" }),                            // block
+    verdict({ op: "store", payload: "a is not b", embedding: [1, 0, 0, 0] }, {},       // reconcile
+      { reconcileCandidates: async () => [{ id: "p", content: "a is b", embedding: [0.99, 0.01, 0, 0] }] }),
+    verdict({ op: "forget" }, { trustClass: "seat", riskLevel: "high" }),              // escalate
+    verdict({ op: "store", payload: "x" }, {},                                         // inject
+      { injectRules: [() => ({ reason: "r", rationale: "R", correction: "c" })] }),
+  ];
+  const results = await Promise.all(cases);
+  const decisions = results.map((r) => r.decision);
+  assert.deepEqual(decisions, ["allow", "block", "reconcile", "escalate", "inject"]);
+  for (const r of results) {
+    assert.equal(r.contract_version, "1.0", "every decision stamps contract_version 1.0");
+    assert.ok(r.audit_id.length > 0, "every decision carries an audit_id");
+    assert.ok(r.rationale.length > 0, "every decision carries a rationale");
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Static-analysis helpers (deliberately dependency-free; this is a lint).

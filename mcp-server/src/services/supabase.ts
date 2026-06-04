@@ -18,6 +18,8 @@ import type {
   VerdictDeps,
   VerdictAuditEntry,
 } from "./verdict.js";
+import { loadManifest, manifestSummary } from "./manifest.js";
+import type { IntegrityManifest } from "./manifest.js";
 
 /**
  * PostgREST sometimes returns errors without a `.message` field (e.g. PGRST202,
@@ -204,6 +206,35 @@ export class MemoryService {
       ...verdictDeps,
       persistAudit: verdictDeps.persistAudit ?? ((entry) => this.persistVerdictAudit(entry)),
     };
+
+    // Load the integrity manifest at boot (verdict contract §6 — the manifest
+    // is the policy source). A missing manifest is fine (verdict runs on the §4
+    // code floor); a malformed one throws (policy-integrity failure surfaces).
+    // The v1 manifest mirrors the §4 floor, so we observe + log it rather than
+    // override the active rules; richer manifest-compiled rules are the
+    // extension point. Loading failures must NOT crash the server boot.
+    try {
+      this.manifest = loadManifest();
+      const s = manifestSummary(this.manifest);
+      console.error(
+        `[verdict] integrity manifest: ${s.invariant_count} invariants, ` +
+        `signed=${s.signed} (${s.signed ? "authoritative" : "advisory — running on §4 code floor"})`,
+      );
+    } catch (err) {
+      console.error(
+        `[verdict] integrity manifest load failed (running on §4 code floor):`,
+        err instanceof Error ? err.message : String(err),
+      );
+      this.manifest = null;
+    }
+  }
+
+  /** The loaded integrity manifest (§6), or null when absent/unloadable. */
+  private manifest: IntegrityManifest | null = null;
+
+  /** Manifest policy surface, for introspection / boot diagnostics. */
+  get integrityManifest(): IntegrityManifest | null {
+    return this.manifest;
   }
 
   /**
