@@ -726,7 +726,78 @@ test("inject: context.asOf is carried through to the audit (read-path bitemporal
   assert.equal(detail.asOf, asOf, "asOf must be carried into the audit detail");
 });
 
-// §11.6 manifest-only-Sid-surface — PENDING STEP 7
+// ---------------------------------------------------------------------------
+// STEP 7 — manifest of invariants + runtime tuning + §11.6.
+// ---------------------------------------------------------------------------
+
+const MANIFEST_PATH = join(SRC_DIR, "..", "manifest", "invariants.yaml");
+const TUNING_PATH = join(SRC_DIR, "..", "config", "runtime-tuning.jsonl");
+
+test("manifest: parses into structured invariants + signature", async () => {
+  const { parseManifest } = await import("../services/manifest.js");
+  const m = parseManifest(readFileSync(MANIFEST_PATH, "utf8"));
+  assert.ok(m.invariants.length >= 4, "manifest must carry the §6 invariants");
+  for (const inv of m.invariants) {
+    assert.ok(inv.id.length > 0, "every invariant has an id");
+    assert.ok(inv.statement.length > 0, "every invariant has a plain-language statement");
+    assert.ok(["allow", "block", "inject", "reconcile", "escalate"].includes(inv.decision));
+    for (const op of inv.applies_to) {
+      assert.ok(["store", "recall", "correct", "forget"].includes(op), `valid op ${op}`);
+    }
+  }
+});
+
+test("manifest: starts UNSIGNED → not authoritative (cannot widen the §4 floor)", async () => {
+  const { parseManifest, manifestIsAuthoritative } = await import("../services/manifest.js");
+  const m = parseManifest(readFileSync(MANIFEST_PATH, "utf8"));
+  assert.equal(m.signature.signed, false, "ships unsigned until Sid signs at boot");
+  assert.equal(manifestIsAuthoritative(m), false, "unsigned manifest must not widen authority");
+});
+
+test("manifest: a malformed invariant throws (policy-integrity failure surfaces)", async () => {
+  const { parseManifest } = await import("../services/manifest.js");
+  const bad = `invariants:\n  - id: x\n    statement: "y"\n    applies_to: [store]\n    decision: bogus_decision\n`;
+  assert.throws(() => parseManifest(bad), /invalid decision/);
+});
+
+// §11.6 — THE conformance criterion: the manifest (Sid surface) must carry NO
+// numeric parameter. Every floor / threshold / TTL lives in the runtime-tuning
+// JSONL instead. A bare number appearing in any invariant `statement` = a
+// tuning knob leaked into the Sid surface = §11.6 violation.
+test("§11.6: no numeric parameter appears in any manifest invariant statement", async () => {
+  const { parseManifest } = await import("../services/manifest.js");
+  const m = parseManifest(readFileSync(MANIFEST_PATH, "utf8"));
+  for (const inv of m.invariants) {
+    // Allow no digits at all in a plain-language business statement. (spec_version
+    // lives at the top level, not in a statement; ids are kebab-case words.)
+    assert.ok(
+      !/\d/.test(inv.statement),
+      `§11.6 violation: invariant '${inv.id}' statement carries a number: "${inv.statement}"`,
+    );
+  }
+});
+
+test("§11.6: the runtime-tuning surface DOES carry the numeric knobs (separation holds)", () => {
+  const jsonl = readFileSync(TUNING_PATH, "utf8").trim().split("\n").filter(Boolean);
+  assert.ok(jsonl.length >= 1, "runtime-tuning JSONL must carry tuning rows");
+  let sawNumber = false;
+  for (const line of jsonl) {
+    const row = JSON.parse(line) as { param: string; value: unknown };
+    assert.ok(typeof row.param === "string", "each tuning row names a param");
+    if (typeof row.value === "number") sawNumber = true;
+  }
+  assert.ok(sawNumber, "the numeric knobs live HERE, not in the manifest");
+});
+
+test("§11.6: manifestSummary exposes ids + signed flag (introspection, no numbers)", async () => {
+  const { parseManifest, manifestSummary } = await import("../services/manifest.js");
+  const m = parseManifest(readFileSync(MANIFEST_PATH, "utf8"));
+  const s = manifestSummary(m);
+  assert.equal(s.signed, false);
+  assert.ok(s.invariant_count >= 4);
+  assert.ok(s.invariant_ids.includes("no-destruction-without-authority"));
+});
+
 // §11.7 contract-identical-A/B    — PENDING Profil B (post-dogfood)
 
 // ---------------------------------------------------------------------------

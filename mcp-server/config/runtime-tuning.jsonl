@@ -1,0 +1,3 @@
+{"ts":"2026-06-04T00:00:00.000Z","actor":"build-seat","param":"reconcile_cosine_topic_threshold","value":0.85,"note":"§10.3 same-topic floor for reconcile contradiction detection — numeric tuning, NEVER surfaced to Sid (verdict contract §6.2)"}
+{"ts":"2026-06-04T00:00:00.000Z","actor":"build-seat","param":"dedup_near_duplicate_threshold","value":0.92,"note":"store near-duplicate merge floor (createWithDedupInfo) — runtime tuning"}
+{"ts":"2026-06-04T00:00:00.000Z","actor":"build-seat","param":"reconcile_candidate_pool_size","value":5,"note":"top-K neighbours fetched as reconcile candidates per store — runtime tuning"}

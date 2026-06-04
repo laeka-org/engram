@@ -1,0 +1,54 @@
+# invariants.yaml — the Monade integrity manifest (verdict contract v1, §6).
+#
+# THIS IS THE ONLY SURFACE SID SIGNS. It is plain-language business policy —
+# NO numeric parameters, NO similarity floors, NO TTLs, NO collection names.
+# Every numeric tuning knob lives in config/runtime-tuning.jsonl (auditable,
+# never shown to Sid). Changing an invariant here = a re-signature by Sid (a
+# formal tranche, §6.1), not a runtime tweak.
+#
+# verdict() (services/verdict.ts) reads this manifest as its source of policy
+# via services/manifest.ts, which compiles each invariant into a block /
+# inject / escalate rule. Monade applies; the manifest authorises.
+#
+# Conformance §11.6: a static test asserts no numeric parameter appears in any
+# `statement` field below — if one does, the manifest has leaked a tuning knob
+# into the Sid surface and the test fails.
+
+spec_version: "1.0"
+
+invariants:
+  - id: memory-active-in-prod
+    statement: "Memory is active in production."
+    applies_to: [store, recall, correct, forget]
+    decision: allow
+
+  - id: no-destruction-without-authority
+    statement: "Forgetting or destructive correction requires a trusted seat; an untrusted or external caller may not destroy memory."
+    applies_to: [forget, correct]
+    decision: block
+
+  - id: preferences-kept-volatile-facts-expire-invariants-never
+    statement: "Preferences are kept; volatile facts may expire; invariants never expire."
+    applies_to: [forget]
+    decision: allow
+
+  - id: contradictions-reconcile-never-drop
+    statement: "When a new fact contradicts an existing one, reconcile by superseding with provenance; never silently drop either."
+    applies_to: [store, correct]
+    decision: reconcile
+
+  - id: unresolvable-conflicts-escalate
+    statement: "A conflict the policy cannot resolve is handed up to the seat; it is never resolved by silent guess."
+    applies_to: [store, correct, forget]
+    decision: escalate
+
+# Signature marker — populated once at boot by signWithSelfKey (services/
+# signature.ts), reusing the RFC 8785 canonicalization + Ed25519 self-key
+# pattern already used for swarm records. Until signed, the manifest is
+# UNSIGNED and the loader marks it as such (verdict still runs on the §4 code
+# floor; the manifest cannot WIDEN authority while unsigned).
+signature:
+  signed: false
+  signed_at: null
+  signed_by: null
+  value: null
