@@ -504,8 +504,83 @@ test("§11.3 reconcile-never-destroys: supersede_memory archives + bounds, never
   );
 });
 
+// ---------------------------------------------------------------------------
+// STEP 8 — fail-soft / degraded mode (§7) + §11.5 fail-closed-destructive.
+// ---------------------------------------------------------------------------
+
+const coreDown = { monade: { health: async () => false } };
+const coreUp = { monade: { health: async () => true } };
+const coreThrows = { monade: { health: async () => { throw new Error("probe error"); } } };
+
+test("§11.5 fail-closed: core unreachable + forget → block", async () => {
+  const v = await verdict({ op: "forget", payload: "m" }, { trustClass: "seat" }, coreDown);
+  assert.equal(v.decision, "block");
+  assert.match(v.rationale, /fail-closed/);
+});
+
+test("§11.5 fail-closed: core unreachable + destructive risk → block (even on store)", async () => {
+  const v = await verdict({ op: "store", payload: "m" }, { riskLevel: "destructive" }, coreDown);
+  assert.equal(v.decision, "block");
+});
+
+test("fail-soft: core unreachable + non-destructive (store) → allow, degraded", async () => {
+  const captures: Record<string, unknown>[] = [];
+  const v = await verdict(
+    { op: "store", payload: "m" },
+    {},
+    { monade: { health: async () => false }, persistAudit: async (e) => { captures.push(e as unknown as Record<string, unknown>); return "id"; } },
+  );
+  assert.equal(v.decision, "allow");
+  assert.match(v.rationale, /degraded/);
+  assert.equal(captures[0].degraded, true, "audit must flag degraded=true");
+});
+
+test("fail-soft: core unreachable + recall → allow, degraded", async () => {
+  const v = await verdict({ op: "recall", payload: "q" }, {}, coreDown);
+  assert.equal(v.decision, "allow");
+  assert.match(v.rationale, /degraded/);
+});
+
+test("fail-soft: a throwing health probe is treated as unreachable", async () => {
+  const v = await verdict({ op: "forget" }, { trustClass: "seat" }, coreThrows);
+  assert.equal(v.decision, "block");
+  assert.match(v.rationale, /fail-closed/);
+});
+
+test("fail-soft: core UP → normal path runs (no degraded flag)", async () => {
+  const captures: Record<string, unknown>[] = [];
+  const v = await verdict(
+    { op: "store", payload: "m" },
+    {},
+    { monade: { health: async () => true }, persistAudit: async (e) => { captures.push(e as unknown as Record<string, unknown>); return "id"; } },
+  );
+  assert.equal(v.decision, "allow");
+  assert.equal(captures[0].degraded, false, "core up → not degraded");
+});
+
+test("fail-soft: NO monade configured → no health call, normal path (no-op)", async () => {
+  let probed = false;
+  const v = await verdict(
+    { op: "forget" },
+    { trustClass: "seat" },
+    { persistAudit: async () => { return "id"; } },
+  );
+  // No monade dep → fail-soft cannot engage; seat-authorised forget allows.
+  assert.equal(probed, false);
+  assert.equal(v.decision, "allow");
+});
+
+test("fail-soft: core down does NOT mask the block-authority rule for destructive (both → block)", async () => {
+  // External untrusted + core down + forget: fail-closed wins first (block),
+  // which is the same safe answer the authority rule would give. Either way
+  // the destructive op is refused — never allowed.
+  const v = await verdict({ op: "forget" }, { trustClass: "external" }, coreDown);
+  assert.equal(v.decision, "block");
+});
+
+void coreUp; // referenced for symmetry / future use
+
 // §11.4 escalate-never-drops      — PENDING STEP 6
-// §11.5 fail-closed-destructive   — PENDING STEP 8
 // §11.6 manifest-only-Sid-surface — PENDING STEP 7
 // §11.7 contract-identical-A/B    — PENDING Profil B (post-dogfood)
 

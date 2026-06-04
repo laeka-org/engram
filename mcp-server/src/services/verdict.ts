@@ -333,6 +333,42 @@ export async function verdict(
   const trustClass = context.trustClass ?? "untrusted";
   const riskLevel = context.riskLevel ?? "low";
 
+  // STEP 8 — fail-soft / degraded mode (contract §7). Only engages when a
+  // Monade core is configured (deps.monade) AND its liveness probe reports it
+  // unreachable. Policy:
+  //   - destructive op (forget / destructive risk) + core unreachable →
+  //     fail-CLOSED (block). We never destroy without a living judgement.
+  //   - non-destructive op (store / recall) + core unreachable →
+  //     allow-WITH-LOG (proceed, flag degraded in the audit). Continuity is
+  //     preserved, traceability maintained.
+  // When no core is configured (the STEP-1..7 fast-path-only build), this is a
+  // no-op — fail-soft has nothing to fail soft on.
+  if (deps.monade) {
+    let coreLive = true;
+    try {
+      coreLive = await deps.monade.health();
+    } catch {
+      coreLive = false; // a throwing probe = unreachable, fail-soft engages.
+    }
+    if (!coreLive) {
+      const destructive = isDestructive(action, context);
+      const decision: VerdictDecision = destructive ? "block" : "allow";
+      const rationale = destructive
+        ? `block (fail-closed §7): Monade core unreachable, destructive op=${action.op} refused — no destruction without living judgement`
+        : `allow (degraded §7): Monade core unreachable, non-destructive op=${action.op} proceeds with degraded flag`;
+      const audit_id = await recordAudit(deps, {
+        op: action.op,
+        decision,
+        rationale,
+        seat_id: seatId,
+        trust_class: trustClass,
+        risk_level: riskLevel,
+        degraded: true,
+      });
+      return makeVerdict(decision, rationale, audit_id);
+    }
+  }
+
   // STEP 2 — block layer (generalised from admission-gate). Fast, pure, local.
   // First deny wins. Manifest-fed rules (STEP 7) override the §4 floor.
   const rules = deps.blockRules ?? DEFAULT_BLOCK_RULES;
