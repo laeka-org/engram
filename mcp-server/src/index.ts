@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createEmbeddingProvider } from "./services/embeddings.js";
 import { MemoryService } from "./services/supabase.js";
+import { buildMonadeCore } from "./services/monade-core.js";
 import { rememberSchema, remember } from "./tools/remember.js";
 import { recallSchema, recall } from "./tools/recall.js";
 import { forgetSchema, forget } from "./tools/forget.js";
@@ -201,7 +202,13 @@ if (!SUPABASE_KEY) {
 }
 
 const embeddings = createEmbeddingProvider();
-const memoryService = new MemoryService(SUPABASE_URL, SUPABASE_KEY, embeddings);
+// Wire the living Monade judge onto verdict()'s escalate path. buildMonadeCore
+// returns undefined when ENGRAM_MONADE_JUDGE_DISABLE=1 (one-env rollback), in
+// which case the gate runs judge-less exactly as before. When present, verdict()
+// still consults it ONLY on escalate (high-risk destructive op from a trusted
+// seat); every failure mode degrades safe (judge throw → local escalate).
+const monade = buildMonadeCore();
+const memoryService = new MemoryService(SUPABASE_URL, SUPABASE_KEY, embeddings, { monade });
 const experienceService = new ExperienceService(SUPABASE_URL, SUPABASE_KEY, embeddings);
 const affectService = new AffectService(SUPABASE_URL, SUPABASE_KEY);
 const beliefService = new BeliefService(
