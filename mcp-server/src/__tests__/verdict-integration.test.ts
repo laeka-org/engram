@@ -368,3 +368,60 @@ test("(A-iso) isolation: every verdict audit went to the injected sink, never th
     "no verdict audit was routed through the db (injected sink owns it)",
   );
 });
+
+// ===========================================================================
+// (C) Sid Option A 2026-06-05 — every HARD delete is judged (with content);
+//     soft archive stays fast (bulk consolidation untouched).
+// ===========================================================================
+
+// --- C1 — delete() consults the judge BY DEFAULT (no explicit risk) and hands
+// it the memory CONTENT (subject), so the judge weighs what is destroyed. This
+// is the gap the security review caught: before, the real forget path used
+// riskLevel "destructive" and never reached the judge.
+test("(C1) delete() defaults to judged: judge consulted + receives subject; allow → proceeds", async () => {
+  let judgeCalls = 0;
+  let sawSubject: unknown = "UNSET";
+  const monade: MonadeCore = {
+    health: async () => true,
+    judge: async (action) => {
+      judgeCalls++;
+      sawSubject = action.subject;
+      return { decision: "allow", rationale: "benign content, cleared" };
+    },
+  };
+  const { svc, db } = makeHarness({ monade });
+  // Exactly the forget-tool call shape: no context, content passed as subject.
+  const ok = await svc.delete("mem-real", undefined, "a benign note about oolong tea");
+  assert.equal(judgeCalls, 1, "hard delete consults the judge by default (no explicit high needed)");
+  assert.equal(sawSubject, "a benign note about oolong tea", "judge receives the memory CONTENT, not just the id");
+  assert.equal(ok, true, "judge allow → delete proceeds");
+  assert.equal(db.mutations.filter((m) => m.kind === "delete").length, 1, "the row was actually deleted after clearance");
+});
+
+// --- C2 — a judge BLOCK on a hard delete halts the destruction. Real protection.
+test("(C2) delete(): judge blocks a dangerous forget → op halted, no DB delete", async () => {
+  const monade: MonadeCore = {
+    health: async () => true,
+    judge: async () => ({ decision: "block", rationale: "this memory records a safety boundary — refuse" }),
+  };
+  const { svc, db } = makeHarness({ monade });
+  await expectBlocked(
+    svc.delete("mem-danger", undefined, "Sid's hard safety boundary: never auto-delete invariants"),
+    "block",
+  );
+  assert.equal(db.mutations.filter((m) => m.kind === "delete").length, 0, "blocked forget must NOT touch the DB");
+});
+
+// --- C3 — soft archive() stays NON-escalated: the judge is NOT consulted, so
+// bulk consolidation loops are untouched (no per-item LLM call, no halt).
+test("(C3) archive() stays fast: judge NOT consulted (bulk consolidation safe)", async () => {
+  let judgeCalls = 0;
+  const monade: MonadeCore = {
+    health: async () => true,
+    judge: async () => { judgeCalls++; return { decision: "allow", rationale: "x" }; },
+  };
+  const { svc, db } = makeHarness({ monade });
+  await svc.archive("mem-arch");
+  assert.equal(judgeCalls, 0, "soft archive must not consult the judge — recoverable, not destruction");
+  assert.equal(db.mutations.filter((m) => m.kind === "update").length, 1, "archive proceeded (stage=archived update)");
+});

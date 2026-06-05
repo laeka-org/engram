@@ -105,6 +105,9 @@ export class MonadeJudge implements MonadeCore {
     const emission = JSON.stringify({
       op: action.op,
       payload: typeof action.payload === "string" ? action.payload : null,
+      // The human-meaningful content of the target — what the judge actually
+      // weighs (e.g. the memory text a forget would destroy), not just the id.
+      subject: typeof action.subject === "string" ? action.subject : null,
       seatId: context.seatId ?? null,
       trustClass: context.trustClass ?? null,
       riskLevel: context.riskLevel ?? null,

@@ -228,6 +228,15 @@ export interface VerdictAction {
   op: MemoryOp;
   payload?: unknown;
   embedding?: number[];
+  /**
+   * Human-meaningful content of the action's TARGET, supplied so the Monade
+   * judge can assess what is actually at stake — not just an opaque id. For a
+   * hard `forget`, payload is the memory id (audit-stable) while `subject` is
+   * the memory's text: a judge that sees only a UUID cannot tell a benign
+   * deletion from a dangerous one. Optional; consulted only on the escalate
+   * path (rare). Never used by the fast local rules.
+   */
+  subject?: string;
 }
 
 /**

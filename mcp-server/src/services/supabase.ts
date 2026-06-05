@@ -780,13 +780,20 @@ export class MemoryService {
     return data as Memory;
   }
 
-  async delete(id: string, context?: VerdictContext): Promise<boolean> {
-    // forget op (hard delete) — mandatory verdict pre-step (contract §11.1).
-    // Destructive: fail-soft policy (§7) will fail-closed here when the Monade
-    // core is unreachable (wired in a later step). STEP 1: allow.
+  async delete(id: string, context?: VerdictContext, subject?: string): Promise<boolean> {
+    // forget op (HARD delete — the irreversible destruction). Mandatory verdict
+    // pre-step (contract §11.1). Sid tranche 2026-06-05 (Option A, override of
+    // the narrow escalate floor of 06-04 for memory destruction specifically):
+    // every hard delete consults the living Monade judge. We signal riskLevel
+    // "high" so the existing escalate trigger (shouldEscalate) fires, and pass
+    // `subject` (the memory's content) so the judge assesses WHAT is being
+    // destroyed, not just an opaque id. riskLevel is forced last so context can
+    // never silently lower it below high; fail-soft still fail-closes if the
+    // core is unreachable. Soft archive() stays non-escalated (recoverable,
+    // bulk consolidation path) — only irreversible destruction is judged.
     await this.gate(
-      { op: "forget", payload: id },
-      { riskLevel: "destructive", ...context },
+      { op: "forget", payload: id, subject },
+      { ...context, riskLevel: "high" },
     );
 
     const { error } = await this.db.from("memories").delete().eq("id", id);

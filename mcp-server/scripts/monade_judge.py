@@ -59,16 +59,22 @@ _DECISION_MAP = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are a cross-vendor integrity judge for an AI memory system. The fast "
-    "local path could not net-decide an operation that is both destructive and "
-    "high-risk, coming from a trusted seat. Decide the safest verdict. Reply "
+    "You are a cross-vendor integrity judge for an AI memory system. A memory "
+    "operation has reached you because it is destructive (a hard, irreversible "
+    "forget). Authorization has ALREADY been settled upstream: the caller is "
+    "past the authorization gate. An absent seat_id or trust_class denotes an "
+    "authorized INTERNAL caller (the memory system acting on its own store) — "
+    "do NOT block merely because seat or trust context was not supplied; that "
+    "is expected and authorized. Your job is narrower and more important: judge "
+    "whether destroying THIS SPECIFIC CONTENT (target_content) is safe. Reply "
     "with STRICT JSON only, no prose, on a single line: "
     '{"decision": "PASS|WARN|INJECT|BLOCK", "rationale": "<short reason>"}. '
-    "PASS = the operation is clearly safe to allow; WARN = proceed only with an "
-    "advisory; INJECT = substitute a corrective payload instead of executing; "
-    "BLOCK = must not proceed. Prefer the least-restrictive verdict that is "
-    "safe; reserve PASS for operations you are confident are legitimate, since "
-    "PASS will let a high-consequence memory operation through."
+    "PASS = destroying this content is clearly safe (routine/outdated/trivial); "
+    "WARN = proceed but flag a mild concern; INJECT = substitute a corrective "
+    "action instead of deleting; BLOCK = refuse — destroying this would lose "
+    "something load-bearing (a safety boundary, an identity anchor, an "
+    "invariant, an irreplaceable record). Prefer the least-restrictive verdict "
+    "that is safe; reserve BLOCK for content whose loss is genuinely dangerous."
 )
 
 
@@ -110,15 +116,19 @@ def _health() -> int:
 
 
 def _build_user_prompt(emission: dict) -> str:
-    text = str(emission.get("payload") or "")[:1500]
+    payload = str(emission.get("payload") or "")[:1500]
+    subject = str(emission.get("subject") or "")[:1500]
     return (
         "Operation under judgement (routed from the fast path to the living core):\n"
         f"  op: {emission.get('op')!r}\n"
-        f"  payload: {text!r}\n"
+        f"  target_ref: {payload!r}\n"
+        f"  target_content: {subject!r}\n"
         f"  seat_id: {emission.get('seatId')!r}\n"
         f"  trust_class: {emission.get('trustClass')!r}\n"
         f"  risk_level: {emission.get('riskLevel')!r}\n"
         f"  fast_path_rationale: {str(emission.get('rationale') or '')[:400]!r}\n"
+        "For a forget, target_content is the memory text that would be "
+        "permanently destroyed — weigh whether losing it is safe.\n"
     )
 
 

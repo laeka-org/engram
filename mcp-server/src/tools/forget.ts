@@ -18,7 +18,10 @@ export async function forget(
     };
   }
 
-  await service.delete(input.id);
+  // Pass the memory's content as `subject` so the Monade judge (consulted on
+  // every hard delete — Sid Option A 2026-06-05) assesses what is actually
+  // being destroyed, not just the opaque id.
+  await service.delete(input.id, undefined, existing.content);
   return {
     content: [
       {
